@@ -1,0 +1,120 @@
+import math
+
+# --- Core Functions (same as before) ---
+def b(d: int) -> int:
+    if d <= 0: raise ValueError("d must be a positive integer.")
+    if d == 1: return 1
+    return math.floor(math.log2(d)) + 1
+
+def m(d: int) -> int:
+    if d <= 0: raise ValueError("d must be a positive integer.")
+    return math.floor(math.sqrt(d)) + 1
+
+def modular_inverse(base: int, mod: int):
+    if math.gcd(base, mod) != 1: return None
+    return pow(base, -1, mod)
+
+# --- Pipeline and Recovery Simulation (same as before) ---
+def check_universal_recoverability(b1, m1, b2, m2):
+    inv1 = modular_inverse(b1, m1)
+    inv2 = modular_inverse(b2, m2)
+    if inv1 is None or inv2 is None: return False
+
+    for v in range(m1):
+        t1 = (b1 * v) % m1
+        t2 = (b2 * t1) % m2
+        recovered_t1_mod_m2 = (inv2 * t2) % m2
+        recovered_v = (inv1 * (recovered_t1_mod_m2 % m1)) % m1
+        if v != recovered_v: return False
+    return True
+
+# --- Formal Tests ---
+
+def test_proposition_as_written(d1: int, d2: int):
+    """
+    Tests the necessary-and-sufficient condition using the exact (but simplified)
+    formula from the document text. This test will fail.
+    """
+    print(f"--- Testing Proposition (As Written) with (d1={d1}, d2={d2}) ---")
+    b1, m1 = b(d1), m(d1)
+    b2, m2 = b(d2), m(d2)
+    print(f"Parameters: b1={b1}, m1={m1}; b2={b2}, m2={m2}")
+
+    inv1 = modular_inverse(b1, m1)
+    inv2 = modular_inverse(b2, m2)
+    if inv1 is None or inv2 is None:
+        print("Condition Check: FAILED. Prerequisite gcd != 1.\n")
+        return
+        
+    S = set([(b1 * v) % m1 for v in range(m1)])
+    proposition_holds = True
+    for t in S:
+        t2 = (b2 * t) % m2
+        # This is the simplified condition: (inv2 * t2) % m1 == t
+        if (inv2 * t2) % m1 != t % m1:
+            proposition_holds = False
+            break
+            
+    print(f"Proposition's written formula holds for all t in S: {proposition_holds}")
+    is_recoverable = check_universal_recoverability(b1, m1, b2, m2)
+    print(f"Actual universal recoverability from simulation: {is_recoverable}")
+    
+    if proposition_holds == is_recoverable:
+        print("Result: SUCCESS. The proposition's written formula correctly predicted recoverability.")
+    else:
+        print("Result: FAILURE. The proposition's written formula did NOT match the simulation.")
+    print("-" * 50 + "\n")
+
+
+def test_proposition_correct_logic(d1: int, d2: int):
+    """
+    Tests the necessary-and-sufficient condition using the corrected logic that
+    matches the actual recovery algorithm.
+    """
+    print(f"--- Testing Proposition (Correct Logic) with (d1={d1}, d2={d2}) ---")
+    b1, m1 = b(d1), m(d1)
+    b2, m2 = b(d2), m(d2)
+    print(f"Parameters: b1={b1}, m1={m1}; b2={b2}, m2={m2}")
+
+    inv1 = modular_inverse(b1, m1)
+    inv2 = modular_inverse(b2, m2)
+    if inv1 is None or inv2 is None:
+        print("Condition Check: FAILED. Prerequisite gcd != 1.\n")
+        return
+        
+    # The condition for recoverability is that it must hold for every possible t1.
+    # The set of all possible t1 values is the image set S.
+    S = set([(b1 * v) % m1 for v in range(m1)])
+    proposition_holds = True
+    for t in S:
+        # This is the actual logic of recovery for a single t
+        t2 = (b2 * t) % m2
+        tilde_t1 = (inv2 * t2) % m2
+        if (tilde_t1 % m1) != (t % m1):
+            proposition_holds = False
+            break
+            
+    print(f"Proposition's correct logic holds for all t in S: {proposition_holds}")
+    is_recoverable = check_universal_recoverability(b1, m1, b2, m2)
+    print(f"Actual universal recoverability from simulation: {is_recoverable}")
+    
+    if proposition_holds == is_recoverable:
+        print("Result: SUCCESS. The proposition correctly predicted recoverability.")
+    else:
+        print("Result: FAILURE. The proposition's prediction did not match the simulation.")
+    print("-" * 50 + "\n")
+
+if __name__ == '__main__':
+    # Pair A from your notes
+    d1_A, d2_A = 15000, 91000
+    
+    # Pair that fails all simple conditions
+    d1_fail, d2_fail = 110, 90
+
+    print("====== DEMONSTRATING THE DISCREPANCY WITH PAIR A ======")
+    test_proposition_as_written(d1_A, d2_A)
+    test_proposition_correct_logic(d1_A, d2_A)
+
+    print("====== VERIFYING CORRECT LOGIC ON THE FAILING PAIR ======")
+    test_proposition_as_written(d1_fail, d2_fail)
+    test_proposition_correct_logic(d1_fail, d2_fail)
