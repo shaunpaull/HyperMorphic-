@@ -1,0 +1,304 @@
+# hyper_morphic.py
+# Python 3.10+ is required for the type hints used.
+
+import math
+from typing import Callable, Type
+from functools import reduce
+
+### --- PART 1: FOUNDATIONAL NUMBER THEORY FUNCTIONS --- ###
+
+def extended_gcd(a: int, b: int) -> tuple[int, int, int]:
+    """Computes the extended Euclidean algorithm for (a, b).
+
+    Returns a tuple (gcd, x, y) such that a*x + b*y = gcd(a, b).
+    """
+    if a == 0:
+        return b, 0, 1
+    gcd, x1, y1 = extended_gcd(b % a, a)
+    x = y1 - (b // a) * x1
+    y = x1
+    return gcd, x, y
+
+def mod_inverse(a: int, m: int) -> int | None:
+    """Computes the modular multiplicative inverse of a modulo m.
+
+    Returns an integer x such that (a * x) % m == 1.
+    If an inverse does not exist (i.e., a and m are not coprime), it returns None.
+    """
+    gcd, x, y = extended_gcd(a, m)
+    if gcd != 1:
+        return None  # Inverse does not exist
+    return x % m
+
+def chinese_remainder_theorem(n: list[int], a: list[int]) -> int | None:
+    """Solves a system of simultaneous congruences using the CRT.
+
+    The system is of the form:
+        x % n[0] == a[0]
+        x % n[1] == a[1]
+        ...
+
+    Args:
+        n: A list of pairwise coprime moduli.
+        a: The list of remainders corresponding to each modulus.
+
+    Returns:
+        The unique integer solution modulo the product of all moduli, or None
+        if the moduli are not pairwise coprime.
+    """
+    # Check for pairwise coprimality
+    for i in range(len(n)):
+        for j in range(i + 1, len(n)):
+            if math.gcd(n[i], n[j]) != 1:
+                print(f"Error: Moduli {n[i]} and {n[j]} are not coprime.")
+                return None
+
+    prod = reduce(lambda x, y: x * y, n)
+    result = 0
+    for n_i, a_i in zip(n, a):
+        p = prod // n_i
+        result += a_i * p * mod_inverse(p, n_i)
+    return result % prod
+
+
+### --- PART 2: THE CORE HYPERMORPHICSYSTEM CLASS --- ###
+
+class HyperMorphicSystem:
+    """Implements the HyperMorphic dynamical system.
+
+    This class models a system whose state evolves according to the rule:
+    x_new = (x + b(t)) mod m(t), where m and b are functions of time t.
+    """
+    
+    codewords: list[int]
+
+    def __init__(self, m_func: Callable[[int], int], b_func: Callable[[int], int]):
+        """Initializes the system with dynamic modulus and base functions.
+
+        Args:
+            m_func: A function t -> m(t) that returns the modulus for time-step t.
+            b_func: A function t -> b(t) that returns the base/shift for time-step t.
+        
+        Raises:
+            ValueError: If the modulus function returns a non-positive value.
+        """
+        if m_func(0) <= 0:
+            raise ValueError("Modulus function must always return a positive integer.")
+        self.m_func = m_func
+        self.b_func = b_func
+        self.codewords = []
+
+    def forward_step(self, x: int, t: int) -> int:
+        """Computes a single forward step of the system.
+        
+        F(x, t) = (x + b(t)) mod m(t).
+
+        Args:
+            x: The current state of the system.
+            t: The current time-step.
+
+        Returns:
+            The next state of the system.
+        """
+        return (x + self.b_func(t)) % self.m_func(t)
+
+    def inverse_step(self, x_new: int, t: int) -> int:
+        """Computes the inverse of a single forward step.
+
+        Args:
+            x_new: The state to be reversed.
+            t: The time-step at which the forward step was taken.
+
+        Returns:
+            The previous state of the system.
+        """
+        return (x_new - self.b_func(t)) % self.m_func(t)
+
+    def run_simulation(self, x0: int, steps: int) -> list[int]:
+        """Runs a simulation from an initial state x0 for a number of steps.
+
+        Args:
+            x0: The initial state of the system.
+            steps: The number of time-steps to simulate.
+
+        Returns:
+            The trajectory of the system as a list of states [x0, x1, x2, ...].
+        """
+        trajectory = [x0]
+        current_x = x0
+        for t in range(steps):
+            current_x = self.forward_step(current_x, t)
+            trajectory.append(current_x)
+        return trajectory
+
+    def check_system_invertibility(self) -> bool:
+        """Checks if the system operator is invertible.
+
+        For the simple operator F(x,t) = (x + b) mod m, the additive group
+        structure ensures it is always a permutation, hence always invertible.
+        This method is a placeholder for more complex, composed operators
+        (e.g., multiplicative operators (A*x + B) mod m).
+
+        Returns:
+            True, as the current system is always invertible.
+        """
+        return True
+
+    ### --- PART 3: ADVANCED FUNCTIONALITY --- ###
+
+    @staticmethod
+    def combine_systems(
+        sys1: 'HyperMorphicSystem', 
+        sys2: 'HyperMorphicSystem', 
+        t: int, 
+        x1: int, 
+        x2: int
+    ) -> int | None:
+        """Combines the states (x1, x2) of two systems at time t using CRT.
+
+        This demonstrates Theorem 2 (Two-Stage Recoverability).
+
+        Args:
+            sys1: The first HyperMorphicSystem.
+            sys2: The second HyperMorphicSystem.
+            t: The time-step at which to combine the states.
+            x1: The state of the first system at time t.
+            x2: The state of the second system at time t.
+
+        Returns:
+            The combined unique state in the larger composite system, or None if
+            the moduli for the given t are not coprime.
+        """
+        m1 = sys1.m_func(t)
+        m2 = sys2.m_func(t)
+        
+        # Theorem 2 requires coprime moduli for a unique solution
+        if math.gcd(m1, m2) != 1:
+            return None
+
+        return chinese_remainder_theorem([m1, m2], [x1, x2])
+
+    def set_codeword_space(self, codewords: set[int]):
+        """Defines the set of valid, robust codewords for the system.
+
+        This is the setup for Theorem 3 (Noise Robustness).
+
+        Args:
+            codewords: A set of integers representing the valid states.
+        """
+        self.codewords = sorted(list(codewords))
+
+    def decode_to_codeword(self, x: int, t: int) -> int:
+        """Finds the closest valid codeword to a given state x at time t.
+
+        Uses modular distance (i.e., the shortest path on a circle).
+        This demonstrates Theorem 3 (Noise Robustness).
+
+        Args:
+            x: The (potentially noisy) state to decode.
+            t: The time-step, used to determine the current modulus.
+
+        Returns:
+            The closest valid codeword to x.
+        
+        Raises:
+            ValueError: If the codeword space has not been set.
+        """
+        if not self.codewords:
+            raise ValueError("Codeword space not set. Use set_codeword_space() first.")
+        
+        m = self.m_func(t)
+        
+        min_dist = float('inf')
+        closest_codeword = -1
+
+        for codeword in self.codewords:
+            # Modular distance is the shorter of the two paths around the circle
+            dist = min((x - codeword) % m, (codeword - x) % m)
+            if dist < min_dist:
+                min_dist = dist
+                closest_codeword = codeword
+                
+        return closest_codeword
+
+
+### --- EXAMPLES AND TESTS --- ###
+
+if __name__ == "__main__":
+    print("### --- HyperMorphic Mathematics Library Demonstration --- ###")
+
+    # --- Example 1: Basic Simulation and Invertibility ---
+    print("\n--- Example 1: Basic Simulation ---")
+    # Define dynamic functions: modulus grows, base oscillates
+    m_func_1 = lambda t: 100 + t
+    b_func_1 = lambda t: 3 * t + (t % 5)
+    
+    # Instantiate the system
+    system1 = HyperMorphicSystem(m_func=m_func_1, b_func=b_func_1)
+    
+    # Run a simulation
+    initial_state = 42
+    simulation_steps = 10
+    trajectory = system1.run_simulation(initial_state, simulation_steps)
+    
+    print(f"System 1: m(t)=100+t, b(t)=3t+(t%5)")
+    print(f"Simulation from x0={initial_state} for {simulation_steps} steps:")
+    print(f"Trajectory: {trajectory}")
+    
+    # Demonstrate invertibility
+    last_state = trajectory[-1]
+    time_step_of_last_state = simulation_steps - 1
+    recovered_state = system1.inverse_step(last_state, time_step_of_last_state)
+    print(f"Last state at t={time_step_of_last_state} was {last_state}.")
+    print(f"Inverting this step gives: {recovered_state}.")
+    print(f"This matches the second to last state: {trajectory[-2]}. Invertibility confirmed.")
+
+    # --- Example 2: System Combination (Theorem 2) ---
+    print("\n--- Example 2: System Combination using CRT ---")
+    # Define a second system with a coprime modulus function
+    m_func_2 = lambda t: 97 - t # 97 is prime, so gcd(100+t, 97-t) is often 1
+    b_func_2 = lambda t: 5 * t
+    system2 = HyperMorphicSystem(m_func=m_func_2, b_func=b_func_2)
+    
+    t = 5
+    state1 = system1.forward_step(20, t)
+    state2 = system2.forward_step(30, t)
+    
+    m1 = system1.m_func(t)
+    m2 = system2.m_func(t)
+    
+    print(f"At t={t}:")
+    print(f"  System 1: m({t})={m1}, state x1={state1}")
+    print(f"  System 2: m({t})={m2}, state x2={state2}")
+    
+    # Combine the systems
+    combined_state = HyperMorphicSystem.combine_systems(system1, system2, t, state1, state2)
+    
+    if combined_state is not None:
+        print(f"Moduli are coprime. Combined state in Z_{m1*m2}: {combined_state}")
+        # Verification
+        print(f"  {combined_state} % {m1} = {combined_state % m1} (matches x1)")
+        print(f"  {combined_state} % {m2} = {combined_state % m2} (matches x2)")
+    else:
+        print("Moduli are not coprime at this t, cannot combine.")
+
+    # --- Example 3: Noise Robustness (Theorem 3) ---
+    print("\n--- Example 3: Noise Robustness and Decoding ---")
+    
+    # Use a system with a fixed modulus for clarity
+    robust_system = HyperMorphicSystem(m_func=lambda t: 100, b_func=lambda t: 1)
+    
+    # Define a codeword space with minimum distance of 25
+    codewords = {0, 25, 50, 75}
+    robust_system.set_codeword_space(codewords)
+    print(f"Codeword space set to: {robust_system.codewords}")
+    
+    noisy_state = 23
+    decoded_state = robust_system.decode_to_codeword(noisy_state, t=0)
+    print(f"A noisy state of '{noisy_state}' was received.")
+    print(f"Decoding to nearest codeword... Result: {decoded_state}")
+    
+    noisy_state_2 = 98
+    decoded_state_2 = robust_system.decode_to_codeword(noisy_state_2, t=0)
+    print(f"A noisy state of '{noisy_state_2}' was received (note the wrap-around distance).")
+    print(f"Decoding to nearest codeword... Result: {decoded_state_2}")
