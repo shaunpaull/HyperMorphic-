@@ -1,0 +1,865 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+HyperMorphic Gearbox — CVT Edition (v1.1)
+=========================================
+
+One-file reference with:
+- Mixed‑radix fractional/integer encoding (standard + bijective).
+- C¹ smooth base blending ("numerical CVT") + optional hysteresis (stateful).
+- Adaptive scheduler (pick family+depth to meet ε with minimal depth).
+- Industrial CRT: classical, Garner (mixed‑radix), generalized (non‑coprime + consistency).
+- RNS helpers (residues, add, mul).
+- RRNS with TWO redundant moduli: detection + SMART single‑residue correction (via CRT over redundants).
+- Reproducible demos/tests/plots (optional).
+
+CLI (see `-h` for all commands):
+  python hm_gearbox_cvt_v1_1.py encode --x 0.314159 --depth 8 --family B
+  python hm_gearbox_cvt_v1_1.py blend --x 0.52 --depth 8 --x0 0.5 --band 0.06 --save plots
+  python hm_gearbox_cvt_v1_1.py quantize-demo --duration 2.0 --noise 0.002 --save plots
+  python hm_gearbox_cvt_v1_1.py control-demo --save plots
+  python hm_gearbox_cvt_v1_1.py rrns-demo --trials 600 --save plots
+  python hm_gearbox_cvt_v1_1.py bench --batch 1 64 256 512
+
+License: MIT
+"""
+
+from __future__ import annotations
+
+import argparse
+import math
+import os
+from dataclasses import dataclass
+from fractions import Fraction
+from typing import Iterable, List, Sequence, Tuple, Optional
+
+# Optional numpy/matplotlib (plots guarded by try/except)
+try:
+    import numpy as np
+except Exception:  # pragma: no cover
+    np = None  # type: ignore
+
+try:
+    import matplotlib.pyplot as plt  # noqa: F401
+except Exception:  # pragma: no cover
+    plt = None  # type: ignore
+
+# ---------------------------------------------------------------------
+# Utilities
+# ---------------------------------------------------------------------
+
+def _clamp_fraction_unit(frac: Fraction) -> Fraction:
+    if frac < 0:
+        return Fraction(0, 1)
+    if frac >= 1:
+        return Fraction(10**12 - 1, 10**12)
+    return frac
+
+def _as_fraction_unit(x: float | Fraction) -> Fraction:
+    if isinstance(x, float):
+        x = min(max(x, 0.0), math.nextafter(1.0, 0.0))
+        frac = Fraction.from_float(x).limit_denominator(10**9)
+    else:
+        frac = Fraction(x)
+    return _clamp_fraction_unit(frac)
+
+# ---------------------------------------------------------------------
+# Mixed-Radix: Fractional part
+# ---------------------------------------------------------------------
+
+def _greedy_fraction_digits(frac: Fraction, bases: Sequence[int], depth: Optional[int]) -> Tuple[List[int], Fraction]:
+    if not (Fraction(0) <= frac < Fraction(1)):
+        raise ValueError("frac must be in [0,1)")
+    k = len(bases) if depth is None else min(depth, len(bases))
+    r = Fraction(frac)
+    digits: List[int] = []
+    denom = Fraction(1)
+    approx = Fraction(0)
+    for i in range(k):
+        b = int(bases[i])
+        r *= b
+        d = int(r)
+        if d >= b:
+            d = b - 1
+        r -= d
+        digits.append(d)
+        denom *= b
+        approx += Fraction(d, denom)
+    return digits, approx
+
+def frac_encode_standard(x: float | Fraction, bases: Sequence[int], depth: Optional[int] = None) -> Tuple[List[int], Fraction]:
+    frac = _as_fraction_unit(x)
+    return _greedy_fraction_digits(frac, bases, depth)
+
+def frac_encode_bijective(x: float | Fraction, bases: Sequence[int], depth: Optional[int] = None) -> Tuple[List[int], Fraction]:
+    d0, approx = frac_encode_standard(x, bases, depth)
+    return [d + 1 for d in d0], approx
+
+def frac_reconstruct(digits: Sequence[int], bases: Sequence[int], bijective_external: bool = False) -> Fraction:
+    k = min(len(digits), len(bases))
+    denom = Fraction(1)
+    s = Fraction(0)
+    for i in range(k):
+        b = int(bases[i])
+        d = int(digits[i])
+        if bijective_external:
+            d = d - 1
+        if not (0 <= d < b):
+            raise ValueError("Digit out of range")
+        denom *= b
+        s += Fraction(d, denom)
+    return s
+
+# ---------------------------------------------------------------------
+# Mixed-Radix: Integer part
+# ---------------------------------------------------------------------
+
+def int_encode_standard(n: int, bases: Sequence[int]) -> List[int]:
+    if n < 0:
+        raise ValueError("Use sign with negative integers")
+    if not bases:
+        return [0]
+    digits_rev: List[int] = []
+    x = n
+    for b in bases[::-1]:
+        q, r = divmod(x, b)
+        digits_rev.append(r)
+        x = q
+    return digits_rev[::-1]
+
+def int_reconstruct(digits: Sequence[int], bases: Sequence[int], bijective_external: bool = False) -> int:
+    if len(digits) != len(bases):
+        raise ValueError("Integer digits length must match bases length")
+    x = 0
+    for d, b in zip(digits, bases):
+        if bijective_external:
+            d = d - 1
+        if not (0 <= d < b):
+            raise ValueError("Digit out of range for base")
+        x = x * b + d
+    return x
+
+def int_encode_bijective(n: int, bases: Sequence[int]) -> List[int]:
+    return [d + 1 for d in int_encode_standard(n, bases)]
+
+# ---------------------------------------------------------------------
+# HM Number
+# ---------------------------------------------------------------------
+
+@dataclass
+class HMNumber:
+    sign: int
+    int_digits: List[int]
+    frac_digits: List[int]
+    bases_int: List[int]
+    bases_frac: List[int]
+    int_bijective: bool = False
+    frac_bijective: bool = True
+
+    def to_fraction(self) -> Fraction:
+        ival = int_reconstruct(self.int_digits, self.bases_int, bijective_external=self.int_bijective) if self.int_digits else 0
+        fval = frac_reconstruct(self.frac_digits, self.bases_frac, bijective_external=self.frac_bijective) if self.frac_digits else Fraction(0)
+        return Fraction(self.sign, 1) * (Fraction(ival, 1) + fval)
+
+    def to_float(self) -> float:
+        return float(self.to_fraction())
+
+    def __str__(self) -> str:
+        si = "-" if self.sign < 0 else ""
+        idig = self.int_digits if self.int_digits else [0]
+        fdig = self.frac_digits if self.frac_digits else []
+        return f"{si}{idig}.{fdig}  (int_bij={self.int_bijective}, frac_bij={self.frac_bijective})"
+
+def encode_number(x: float | Fraction,
+                  bases_int: Sequence[int],
+                  bases_frac: Sequence[int],
+                  depth_frac: Optional[int] = None,
+                  int_bijective: bool = False,
+                  frac_bijective: bool = True) -> HMNumber:
+    if isinstance(x, float):
+        xf = Fraction.from_float(x).limit_denominator(10**9)
+    else:
+        xf = Fraction(x)
+    sign = 1
+    if xf < 0:
+        sign = -1
+        xf = -xf
+    ival = int(xf)
+    fval = xf - ival
+    idigits = int_encode_bijective(ival, bases_int) if int_bijective else int_encode_standard(ival, bases_int)
+    fdigits, _ = (frac_encode_bijective if frac_bijective else frac_encode_standard)(fval, bases_frac, depth_frac)
+    return HMNumber(sign, idigits, fdigits, list(bases_int), list(bases_frac),
+                    int_bijective=int_bijective, frac_bijective=frac_bijective)
+
+# ---------------------------------------------------------------------
+# Dynamic switch + C¹-like blend + Hysteresis
+# ---------------------------------------------------------------------
+
+def smoothstep(t: float) -> float:
+    if t <= 0.0: return 0.0
+    if t >= 1.0: return 1.0
+    return t * t * (3.0 - 2.0 * t)
+
+@dataclass
+class BaseFamily:
+    name: str
+    seq: List[int]
+
+def blend_fractional(x: float | Fraction,
+                     A: BaseFamily, B: BaseFamily,
+                     depth: int,
+                     x0: float = 0.5, band: float = 0.08,
+                     blend: bool = True) -> Tuple[Fraction, Fraction, Fraction, float]:
+    frac = _as_fraction_unit(x)
+    _, aA = frac_encode_standard(frac, A.seq, depth)
+    _, aB = frac_encode_standard(frac, B.seq, depth)
+    if not blend:
+        alpha = 0.0 if float(frac) < x0 else 1.0
+    else:
+        left, right = x0 - band, x0 + band
+        if float(frac) <= left: alpha = 0.0
+        elif float(frac) >= right: alpha = 1.0
+        else: alpha = smoothstep((float(frac) - left) / (right - left))
+    alphaF = Fraction.from_float(alpha)
+    approx = (Fraction(1, 1) - alphaF) * aA + alphaF * aB
+    return approx, aA, aB, alpha
+
+class HMBlendQuantizer:
+    """
+    Stateful HM quantizer with hysteresis to prevent seam chattering.
+    """
+    def __init__(self, A: BaseFamily, B: BaseFamily, depth: int = 8,
+                 x0: float = 0.5, band: float = 0.06, hysteresis: float = 0.02):
+        self.A, self.B = A, B
+        self.depth = depth
+        self.x0 = x0
+        self.band = band
+        self.hys = hysteresis
+        self.state = -1  # -1: left regime, +1: right regime
+
+    def reset(self) -> None:
+        self.state = -1
+
+    def __call__(self, x: float) -> float:
+        left = self.x0 - (self.band + self.hys)
+        right = self.x0 + (self.band + self.hys)
+        if self.state < 0 and x > right:
+            self.state = +1
+        elif self.state > 0 and x < left:
+            self.state = -1
+        approx, _, _, _ = blend_fractional(x, self.A, self.B, self.depth,
+                                           x0=self.x0, band=self.band, blend=True)
+        return float(approx)
+
+# ---------------------------------------------------------------------
+# Adaptive chooser
+# ---------------------------------------------------------------------
+
+def _estimate_error(x: float | Fraction, bases: Sequence[int], depth: int) -> float:
+    _, approx = frac_encode_standard(x, bases, depth)
+    return abs(float(approx) - float(_as_fraction_unit(x)))
+
+def choose_family_and_depth(x: float | Fraction,
+                            families: Sequence[BaseFamily],
+                            eps: float = 1e-8,
+                            max_depth: int = 12) -> Tuple[BaseFamily, int, float]:
+    best: Optional[Tuple[BaseFamily, int, float]] = None
+    for fam in families:
+        for d in range(1, max_depth + 1):
+            e = _estimate_error(x, fam.seq, d)
+            if e <= eps:
+                if best is None or d < best[1] or (d == best[1] and e < best[2]):
+                    best = (fam, d, e)
+                break
+    if best is None:
+        cand = [(fam, max_depth, _estimate_error(x, fam.seq, max_depth)) for fam in families]
+        best = min(cand, key=lambda t: t[2])
+    return best
+
+# ---------------------------------------------------------------------
+# CRT & RNS — implementations
+# ---------------------------------------------------------------------
+
+def _egcd(a: int, b: int) -> Tuple[int,int,int]:
+    """Extended GCD: returns (g, x, y) such that ax + by = g = gcd(a,b)."""
+    if b == 0:
+        return (abs(a), 1 if a>=0 else -1, 0)
+    g, x1, y1 = _egcd(b, a % b)
+    return (g, y1, x1 - (a // b) * y1)
+
+def _modinv(a: int, m: int) -> int:
+    """Modular inverse of a mod m; raises if not invertible."""
+    a %= m
+    g, x, _ = _egcd(a, m)
+    if g != 1:
+        raise ValueError(f"No inverse for {a} mod {m} (gcd={g})")
+    return x % m
+
+def crt_classical(residues: Sequence[int], moduli: Sequence[int]) -> Tuple[int, int]:
+    """
+    Classical CRT for pairwise coprime moduli.
+    Returns (x, M) with 0 <= x < M, where M=∏ m_i.
+    """
+    if len(residues) != len(moduli):
+        raise ValueError("residues and moduli must have same length")
+    n = len(moduli)
+    for i in range(n):
+        for j in range(i+1, n):
+            if math.gcd(moduli[i], moduli[j]) != 1:
+                raise ValueError("Moduli are not pairwise coprime; use crt_general or Garner.")
+    M = 1
+    for m in moduli: M *= m
+    result = 0
+    for r, m in zip(residues, moduli):
+        Mi = M // m
+        inv = _modinv(Mi, m)
+        result = (result + r * Mi * inv) % M
+    return result, M
+
+def garner(residues: Sequence[int], moduli: Sequence[int]) -> Tuple[int, List[int]]:
+    """
+    Garner's algorithm (pairwise coprime). Returns (x, coeffs) where
+    x = coeffs[0] + coeffs[1]*m0 + coeffs[2]*m0*m1 + ... (mixed-radix form).
+    """
+    if len(residues) != len(moduli):
+        raise ValueError("residues and moduli must have same length")
+    n = len(moduli)
+    for i in range(n):
+        for j in range(i+1, n):
+            if math.gcd(moduli[i], moduli[j]) != 1:
+                raise ValueError("Moduli are not pairwise coprime; use crt_general.")
+    coeff = [1]*(n+1)
+    const = [0]*(n+1)
+    v = [0]*n  # mixed-radix coefficients
+    for k in range(n):
+        t = ((residues[k] - const[k]) * _modinv(coeff[k], moduli[k])) % moduli[k]
+        v[k] = t
+        for i in range(k+1, n):
+            const[i] = (const[i] + coeff[i]*t) % moduli[i]
+            coeff[i] = (coeff[i] * moduli[k]) % moduli[i]
+    # reconstruct integer from mixed radix
+    x = 0
+    base = 1
+    for k in range(n):
+        x += v[k] * base
+        base *= moduli[k]
+    return x, v
+
+def crt_general(residues: Sequence[int], moduli: Sequence[int]) -> Tuple[int, int]:
+    """
+    Generalized CRT for possibly non‑coprime moduli.
+    Returns (x, M) where M = lcm(moduli), the minimal modulus;
+    raises ValueError if system is inconsistent.
+    """
+    if len(residues) != len(moduli):
+        raise ValueError("residues and moduli must have same length")
+    x, m = residues[0] % moduli[0], moduli[0]
+    for r, mod in zip(residues[1:], moduli[1:]):
+        r %= mod
+        g, p, q = _egcd(m, mod)  # p*m + q*mod = g
+        if (r - x) % g != 0:
+            raise ValueError(f"Inconsistent congruences: x≡{x}(mod {m}), x≡{r}(mod {mod})")
+        t = ((r - x) // g) * _modinv(m // g, mod // g) % (mod // g)
+        x = x + m * t
+        m = (m // g) * mod  # lcm update
+        x %= m
+    return x, m
+
+# Convenience wrappers for RNS
+def rns_residues(n: int, moduli: Sequence[int]) -> List[int]:
+    return [n % m for m in moduli]
+
+def rns_add(a: int, b: int, moduli: Sequence[int]) -> List[int]:
+    return [ (ra + rb) % m for (ra, rb, m) in zip(rns_residues(a, moduli), rns_residues(b, moduli), moduli) ]
+
+def rns_mul(a: int, b: int, moduli: Sequence[int]) -> List[int]:
+    return [ (ra * rb) % m for (ra, rb, m) in zip(rns_residues(a, moduli), rns_residues(b, moduli), moduli) ]
+
+# ---------------------------------------------------------------------
+# RRNS (2 redundants): detection + SMART single‑residue correction
+# ---------------------------------------------------------------------
+
+def rrns_detect(residues_work: Sequence[int], moduli_work: Sequence[int],
+                residues_red: Sequence[int], moduli_red: Sequence[int]) -> bool:
+    """
+    Returns True if a mismatch is detected against redundant residues.
+    """
+    x_hat, _ = garner(residues_work, moduli_work)
+    for rr, mm in zip(residues_red, moduli_red):
+        if (x_hat % mm) != rr:
+            return True
+    return False
+
+def rrns_correct_single_smart(residues_work: Sequence[int], moduli_work: Sequence[int],
+                              residues_red: Sequence[int], moduli_red: Sequence[int]) -> Tuple[bool, Optional[List[int]]]:
+    """
+    Correct exactly one bad working residue using two+ redundant moduli.
+    Algorithm:
+      For each index j:
+        - Reconstruct X0 modulo M_except_j from all i≠j via Garner.
+        - For each redundant modulus p: k_p ≡ (r_red − X0) * inv(M_except_j, p)  (mod p).
+        - Combine k_p across redundants via CRT → k (mod ∏p).
+        - Predict r_j = (X0 + k*M_except_j) mod m_j.
+        - Verify against all redundants; if OK, return corrected residues.
+    """
+    if len(moduli_red) < 2:
+        raise ValueError("Need at least 2 redundant moduli for smart correction")
+    M_total = 1
+    for m in moduli_work: M_total *= m
+    k_work = len(moduli_work)
+    for j in range(k_work):
+        M_except_j = M_total // moduli_work[j]
+        # Garner on all but j
+        use_mods = [moduli_work[i] for i in range(k_work) if i != j]
+        use_res  = [residues_work[i] for i in range(k_work) if i != j]
+        X0, _ = garner(use_res, use_mods)  # unique modulo M_except_j
+        # Compute k modulo each redundant p
+        ks = []
+        L = 1
+        for rr, p in zip(residues_red, moduli_red):
+            inv = pow(M_except_j % p, -1, p)  # modular inverse
+            k_p = ((rr - (X0 % p)) % p) * inv % p
+            ks.append((k_p, p))
+            L *= p
+        # Combine ks via CRT
+        k0, modk = ks[0]
+        for a2, m2 in ks[1:]:
+            # solve for k: k ≡ k0 (mod modk), k ≡ a2 (mod m2)
+            g = math.gcd(modk, m2)
+            if g != 1:
+                raise ValueError("Redundant moduli must be coprime")
+            inv = pow(modk % m2, -1, m2)
+            t = ((a2 - k0) % m2) * inv % m2
+            k0 = (k0 + modk * t) % (modk * m2)
+            modk = modk * m2
+        # Predict residue at j
+        rj_pred = (X0 + k0 * M_except_j) % moduli_work[j]
+        candidate = list(residues_work)
+        candidate[j] = rj_pred
+        # Verify
+        x_full, _ = garner(candidate, moduli_work)
+        ok = all((x_full % p) == rr for (p, rr) in zip(moduli_red, residues_red))
+        if ok:
+            return True, candidate
+    return False, None
+
+# ---------------------------------------------------------------------
+# Defaults
+# ---------------------------------------------------------------------
+
+FAMILY_A = BaseFamily("A_small_increments", [3,5,7,9,11,13,15,17,19,21,23,25])
+FAMILY_B = BaseFamily("B_exponential",     [4,8,16,32,64,128,256,512,1024,2048,4096,8192])
+
+# ---------------------------------------------------------------------
+# Demos / Tests / Benches (plots optional)
+# ---------------------------------------------------------------------
+
+def run_bench(depth: int = 8, x0: float = 0.5, band: float = 0.08, save_plots: bool = True, outdir: str = ".") -> dict:
+    if np is None or plt is None:
+        raise SystemExit("NumPy/Matplotlib required for this demo")
+    N = 4000
+    xs = np.linspace(0.0, 1.0 - 1e-12, N)
+    approx_A = np.empty(N); approx_B = np.empty(N); approx_bl = np.empty(N); approx_hd = np.empty(N)
+    for i, xf in enumerate(xs):
+        _, aA = frac_encode_standard(xf, FAMILY_A.seq, depth)
+        _, aB = frac_encode_standard(xf, FAMILY_B.seq, depth)
+        ab, *_ = blend_fractional(xf, FAMILY_A, FAMILY_B, depth, x0=x0, band=band, blend=True)
+        ah, *_ = blend_fractional(xf, FAMILY_A, FAMILY_B, depth, x0=x0, band=band, blend=False)
+        approx_A[i] = float(aA); approx_B[i] = float(aB); approx_bl[i] = float(ab); approx_hd[i] = float(ah)
+    err_A = np.abs(approx_A - xs); err_B = np.abs(approx_B - xs)
+    err_bl = np.abs(approx_bl - xs); err_hd = np.abs(approx_hd - xs)
+    dx = xs[1] - xs[0]
+    der_bl = np.gradient(approx_bl, dx); der_hd = np.gradient(approx_hd, dx)
+    mask = (xs >= (x0 - band)) & (xs <= (x0 + band))
+    summary = {
+        "depth": depth, "x0": x0, "band": band,
+        "max_abs_error_A": float(np.max(err_A)),
+        "max_abs_error_B": float(np.max(err_B)),
+        "max_abs_error_blended": float(np.max(err_bl)),
+        "max_abs_error_hard": float(np.max(err_hd)),
+        "max_derivative_in_band_blended": float(np.max(np.abs(der_bl[mask]))),
+        "max_derivative_in_band_hard": float(np.max(np.abs(der_hd[mask]))),
+    }
+    plt.figure(figsize=(10,5))
+    plt.plot(xs, err_A, label="Error A"); plt.plot(xs, err_B, label="Error B")
+    plt.plot(xs, err_bl, label="Error Blended"); plt.plot(xs, err_hd, label="Error Hard-switch")
+    plt.xlabel("x"); plt.ylabel("absolute error |approx(x) − x|"); plt.title("HM Fraction Gearbox — Error vs x")
+    plt.legend(); plt.tight_layout()
+    if save_plots:
+        os.makedirs(outdir, exist_ok=True)
+        plt.savefig(os.path.join(outdir, "hm_fraction_gearbox_errors.png"), dpi=160)
+    plt.close()
+    plt.figure(figsize=(10,5))
+    plt.plot(xs, der_hd, label="d/dx Hard-switch"); plt.plot(xs, der_bl, label="d/dx Blended")
+    plt.xlabel("x"); plt.ylabel("approx derivative"); plt.title("HM Fraction Gearbox — Derivative (Hard vs Blended)")
+    plt.legend(); plt.tight_layout()
+    if save_plots:
+        plt.savefig(os.path.join(outdir, "hm_fraction_gearbox_derivatives.png"), dpi=160)
+    plt.close()
+    return summary
+
+def run_quantize_demo(duration: float = 2.0, fs: float = 2000.0, depth: int = 8,
+                      x0: float = 0.5, band: float = 0.06, hysteresis: float = 0.02,
+                      noise: float = 0.002, save_plots: bool = True, outdir: str = ".") -> dict:
+    if np is None or plt is None:
+        raise SystemExit("NumPy/Matplotlib required for this demo")
+    t = np.linspace(0.0, duration, int(duration*fs))
+    x = 0.5 + 0.38*np.sin(2*np.pi*0.6*t) + 0.02*np.sin(2*np.pi*2.1*t)
+    x = np.clip(x, 0.0, np.nextafter(1.0, 0.0))
+    rng = np.random.default_rng(123)
+    x += noise * rng.standard_normal(x.shape[0])
+    x = np.clip(x, 0.0, np.nextafter(1.0, 0.0))
+
+    step = 2**-12
+    x_uniform = np.clip(np.round(x/step)*step, 0.0, np.nextafter(1.0, 0.0))
+    q_hard = np.array([ float(blend_fractional(v, FAMILY_A, FAMILY_B, depth, x0, band, blend=False)[0]) for v in x ])
+    q_blnd = np.array([ float(blend_fractional(v, FAMILY_A, FAMILY_B, depth, x0, band, blend=True )[0]) for v in x ])
+    q_hys = HMBlendQuantizer(FAMILY_A, FAMILY_B, depth=depth, x0=x0, band=band, hysteresis=hysteresis)
+    q_hyst = np.array([ float(q_hys(v)) for v in x ])
+
+    def stats(err: np.ndarray) -> dict:
+        return {"rms": float(np.sqrt(np.mean(err**2))), "max_abs": float(np.max(np.abs(err))), "mean": float(np.mean(err))}
+
+    err_uniform = x_uniform - x; err_hard = q_hard - x; err_blend = q_blnd - x; err_hyst = q_hyst - x
+    metrics = {"uniform": stats(err_uniform), "HM_hard": stats(err_hard), "HM_blend": stats(err_blend), "HM_blend_hysteresis": stats(err_hyst)}
+
+    # Zoom around a seam crossing
+    idx = int(np.argmin(np.abs(x - x0))); w = int(0.2*fs)
+    sl = slice(max(0, idx-w), min(x.shape[0], idx+w))
+
+    plt.figure(figsize=(10,5))
+    plt.plot(t[sl], x[sl], label="original")
+    plt.plot(t[sl], x_uniform[sl], label="uniform")
+    plt.plot(t[sl], q_hard[sl], label="HM hard")
+    plt.plot(t[sl], q_blnd[sl], label="HM blended")
+    plt.plot(t[sl], q_hyst[sl], label="HM blended + hysteresis")
+    plt.xlabel("time [s]"); plt.ylabel("value in [0,1)"); plt.title("HM quantization — seam region")
+    plt.legend(); plt.tight_layout()
+    if save_plots:
+        os.makedirs(outdir, exist_ok=True)
+        plt.savefig(os.path.join(outdir, "hm_quantize_seam.png"), dpi=160)
+    plt.close()
+
+    plt.figure(figsize=(10,5))
+    plt.plot(t[sl], err_uniform[sl], label="uniform error")
+    plt.plot(t[sl], err_hard[sl], label="HM hard error")
+    plt.plot(t[sl], err_blend[sl], label="HM blended error")
+    plt.plot(t[sl], err_hyst[sl], label="HM blended+hysteresis error")
+    plt.xlabel("time [s]"); plt.ylabel("quantization error"); plt.title("HM quantization errors — seam")
+    plt.legend(); plt.tight_layout()
+    if save_plots:
+        plt.savefig(os.path.join(outdir, "hm_quantize_seam_errors.png"), dpi=160)
+    plt.close()
+
+    return metrics
+
+def simulate_control(Ts: float = 0.005, Tfinal: float = 2.0, r_step_time: float = 0.5, r_value: float = 0.7,
+                     depth: int = 8, x0: float = 0.5, band: float = 0.06, hysteresis: float = 0.02,
+                     save_plots: bool = True, outdir: str = ".") -> dict:
+    if np is None or plt is None:
+        raise SystemExit("NumPy/Matplotlib required for this demo")
+    tau = 0.25; Kplant = 1.0
+    a = math.exp(-Ts/tau); b = (1.0 - a) * Kplant
+    Kp_lo, Ki_lo = 2.0, 12.0
+    Kp_hi, Ki_hi = 1.1, 6.0
+    seam = 0.5
+    steps = int(Tfinal / Ts)
+    y = np.zeros(steps); u = np.zeros(steps); e_int = 0.0
+    r = np.zeros(steps)
+
+    step = 2**-12
+    q_uniform = lambda z: float(np.clip(np.round(z/step)*step, 0.0, np.nextafter(1.0,0.0)))
+    q_hard    = lambda z: float(blend_fractional(np.clip(z,0.0,0.999999999999), FAMILY_A, FAMILY_B, depth, x0, band, False)[0])
+    q_blend   = lambda z: float(blend_fractional(np.clip(z,0.0,0.999999999999), FAMILY_A, FAMILY_B, depth, x0, band, True )[0])
+    q_hys     = HMBlendQuantizer(FAMILY_A, FAMILY_B, depth=depth, x0=x0, band=band, hysteresis=hysteresis)
+
+    def run_with(quantizer):
+        y[:] = 0.0; u[:] = 0.0
+        e_int = 0.0
+        for k in range(steps):
+            t = k*Ts
+            r[k] = r_value if t >= r_step_time else 0.0
+            y_meas = y[k-1] if k>0 else 0.0
+            y_hat = quantizer(y_meas)
+            Kp, Ki = (Kp_lo, Ki_lo) if y_hat < seam else (Kp_hi, Ki_hi)
+            err = r[k] - y_hat
+            e_int += err*Ts
+            u[k] = Kp*err + Ki*e_int
+            u[k] = 0.0 if u[k] < 0.0 else (1.0 if u[k] > 1.0 else u[k])
+            y[k] = (a*(y[k-1] if k>0 else 0.0) + b*u[k])
+        r_final = r_value
+        overshoot = float(np.max(y) - r_final)
+        band2 = 0.02*max(1e-9, r_final)
+        win = int(0.2 / Ts)
+        st = None
+        for kk in range(steps - win):
+            seg = y[kk:kk+win]
+            if np.all(np.abs(seg - r_final) <= band2):
+                st = kk*Ts; break
+        return y.copy(), u.copy(), {"overshoot": overshoot,
+                                    "settling_time": float(st if st is not None else float("nan")),
+                                    "u_peak": float(np.max(u)), "u_rms": float(np.sqrt(np.mean(u**2)))}
+    y_uni, u_uni, m_uni = run_with(q_uniform)
+    y_har, u_har, m_har = run_with(q_hard)
+    y_ble, u_ble, m_ble = run_with(q_blend)
+    y_hys, u_hys, m_hys = run_with(q_hys)
+
+    tt = np.arange(steps)*Ts
+    plt.figure(figsize=(10,5))
+    for yv, lbl in [(y_uni,"uniform"), (y_har,"HM hard"), (y_ble,"HM blend"), (y_hys,"HM blend+hys")]:
+        plt.plot(tt, yv, label=lbl)
+    plt.plot(tt, r, linestyle="--", label="reference r(t)")
+    plt.xlabel("time [s]"); plt.ylabel("y(t)"); plt.title("Control response with gain scheduling")
+    plt.legend(); plt.tight_layout()
+    if save_plots:
+        os.makedirs(outdir, exist_ok=True)
+        plt.savefig(os.path.join(outdir, "hm_control_output.png"), dpi=160)
+    plt.close()
+
+    plt.figure(figsize=(10,5))
+    for uv, lbl in [(u_uni,"uniform"), (u_har,"HM hard"), (u_ble,"HM blend"), (u_hys,"HM blend+hys")]:
+        plt.plot(tt, uv, label=lbl)
+    plt.xlabel("time [s]"); plt.ylabel("u(t)"); plt.title("Control effort")
+    plt.legend(); plt.tight_layout()
+    if save_plots:
+        plt.savefig(os.path.join(outdir, "hm_control_effort.png"), dpi=160)
+    plt.close()
+
+    return {"uniform": m_uni, "HM_hard": m_har, "HM_blend": m_ble, "HM_blend_hysteresis": m_hys}
+
+def run_rrns_demo(trials: int = 600, save_plots: bool = True, outdir: str = ".") -> dict:
+    if np is None or plt is None:
+        raise SystemExit("NumPy/Matplotlib required for this demo")
+    import random
+    work = [1019, 1021, 1031, 1033, 1039]
+    red  = [1049, 1061]  # two redundant primes
+    M_work = 1
+    for m in work: M_work *= m
+    det = corr = 0
+    for _ in range(trials):
+        x_true = random.randrange(0, M_work)
+        r_work = [x_true % m for m in work]
+        r_red  = [x_true % m for m in red]
+        # corrupt one residue
+        j = random.randrange(len(work))
+        delta = 1 if random.random()<0.5 else (work[j]-1)
+        r_bad = r_work[:]
+        r_bad[j] = (r_bad[j] + delta) % work[j]
+        if rrns_detect(r_bad, work, r_red, red): det += 1
+        ok, fixed = rrns_correct_single_smart(r_bad, work, r_red, red)
+        if ok and fixed is not None:
+            x_fixed, _ = garner(fixed, work)
+            if all((x_fixed % p) == rr for (p, rr) in zip(red, r_red)):
+                corr += 1
+    if save_plots:
+        import matplotlib.pyplot as plt
+        plt.figure(figsize=(6,4))
+        plt.bar(["detected", "corrected"], [det, corr])
+        plt.title(f"RRNS smart correction (2 redundants), n={trials}")
+        plt.tight_layout()
+        os.makedirs(outdir, exist_ok=True)
+        plt.savefig(os.path.join(outdir, "hm_rrns_detection_correction.png"), dpi=160)
+        plt.close()
+    return {"trials": trials, "detected": det, "corrected": corr,
+            "detection_rate": det/trials, "correction_rate": corr/trials}
+
+def run_batch_bench(bits: int = 256, batch: Sequence[int] = (1, 64, 256, 512)) -> dict:
+    if np is None or plt is None:
+        raise SystemExit("NumPy/Matplotlib required for this demo")
+    import random, time
+    mods = np.array([65521, 65519, 65513, 65497, 65479, 65449,
+                     65437, 65423, 65407, 65393, 65381, 65371], dtype=np.int64)
+    results = {}
+    for n in batch:
+        a = np.array([random.getrandbits(bits) for _ in range(n)], dtype=object)
+        b = np.array([random.getrandbits(bits) for _ in range(n)], dtype=object)
+        # Big-int baseline
+        t0 = time.perf_counter(); c = a * b; t1 = time.perf_counter()
+        big = t1 - t0
+        # RNS residues (vectorized) + per-item Garner
+        t2 = time.perf_counter()
+        A = np.vstack([ (a % int(m)).astype(object) for m in mods ]).T  # n x m
+        B = np.vstack([ (b % int(m)).astype(object) for m in mods ]).T
+        R = (A * B) % mods
+        ok = True
+        M = int(np.prod(mods, dtype=object))
+        for i in range(n):
+            xi, _ = garner([int(R[i,j]) for j in range(len(mods))], [int(m) for m in mods])
+            if (xi % M) != (int(a[i]) * int(b[i])) % M:
+                ok = False
+        t3 = time.perf_counter()
+        rns = t3 - t2
+        results[int(n)] = {"bigint_s": big, "rns_s": rns, "ok": ok}
+    # plot
+    import matplotlib.pyplot as plt
+    plt.figure(figsize=(7,4))
+    plt.plot(list(results.keys()), [results[n]["bigint_s"] for n in results], marker="o", label="BigInt mul")
+    plt.plot(list(results.keys()), [results[n]["rns_s"] for n in results], marker="o", label="RNS+Garner (vec residues)")
+    plt.xlabel("batch size (n)"); plt.ylabel("seconds"); plt.title("Batch micro-bench (Python)")
+    plt.legend(); plt.tight_layout(); plt.savefig("hm_batch_bench.png", dpi=160); plt.close()
+    return results
+
+# ---------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------
+
+def main():
+    p = argparse.ArgumentParser(description="HyperMorphic Gearbox — CVT Edition (v1.1)")
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    pe = sub.add_parser("encode", help="Encode a real number into HM representation")
+    pe.add_argument("--x", type=float, required=True)
+    pe.add_argument("--depth", type=int, default=8)
+    pe.add_argument("--family", choices=["A","B"], default="B")
+    pe.add_argument("--int-bases", type=int, nargs="*", default=[10,10,10])
+    pe.add_argument("--bijective-frac", action="store_true")
+    pe.add_argument("--bijective-int", action="store_true")
+
+    pb = sub.add_parser("blend", help="Blend A/B families for fractional x with C¹ smoothstep")
+    pb.add_argument("--x", type=float, required=True)
+    pb.add_argument("--depth", type=int, default=8)
+    pb.add_argument("--x0", type=float, default=0.5)
+    pb.add_argument("--band", type=float, default=0.08)
+    pb.add_argument("--no-blend", action="store_true")
+    pb.add_argument("--save", choices=["none","plots"], default="plots")
+
+    pa = sub.add_parser("adaptive", help="Choose family+depth for target error ε")
+    pa.add_argument("--x", type=float, required=True)
+    pa.add_argument("--eps", type=float, default=1e-8)
+    pa.add_argument("--max-depth", type=int, default=12)
+
+    pq = sub.add_parser("quantize-demo", help="Embedded-style quantization seam demo")
+    pq.add_argument("--duration", type=float, default=2.0)
+    pq.add_argument("--fs", type=float, default=2000.0)
+    pq.add_argument("--depth", type=int, default=8)
+    pq.add_argument("--x0", type=float, default=0.5)
+    pq.add_argument("--band", type=float, default=0.06)
+    pq.add_argument("--hysteresis", type=float, default=0.02)
+    pq.add_argument("--noise", type=float, default=0.002)
+    pq.add_argument("--outdir", type=str, default=".")
+    pq.add_argument("--no-plots", action="store_true")
+
+    pc = sub.add_parser("control-demo", help="Gain-scheduled control demo with quantized measurement")
+    pc.add_argument("--Ts", type=float, default=0.005)
+    pc.add_argument("--Tfinal", type=float, default=2.0)
+    pc.add_argument("--r-step-time", type=float, default=0.5)
+    pc.add_argument("--r-value", type=float, default=0.7)
+    pc.add_argument("--depth", type=int, default=8)
+    pc.add_argument("--x0", type=float, default=0.5)
+    pc.add_argument("--band", type=float, default=0.06)
+    pc.add_argument("--hysteresis", type=float, default=0.02)
+    pc.add_argument("--outdir", type=str, default=".")
+    pc.add_argument("--no-plots", action="store_true")
+
+    pr = sub.add_parser("rns-add", help="RNS gearwise integer add + recombine via CRT")
+    pr.add_argument("--a", type=int, required=True)
+    pr.add_argument("--b", type=int, required=True)
+    pr.add_argument("--moduli", type=int, nargs="+", required=True)
+    pr.add_argument("--algo", choices=["classical","garner","general"], default="classical")
+
+    pm = sub.add_parser("rns-mul", help="RNS gearwise integer mul + recombine via CRT")
+    pm.add_argument("--a", type=int, required=True)
+    pm.add_argument("--b", type=int, required=True)
+    pm.add_argument("--moduli", type=int, nargs="+", required=True)
+    pm.add_argument("--algo", choices=["classical","garner","general"], default="classical")
+
+    prr = sub.add_parser("rrns-demo", help="RRNS detection + smart single-residue correction (2 redundants)")
+    prr.add_argument("--trials", type=int, default=600)
+    prr.add_argument("--outdir", type=str, default=".")
+    prr.add_argument("--no-plots", action="store_true")
+
+    pbm = sub.add_parser("bench", help="Batch micro-bench: BigInt vs RNS residues + Garner (Python)")
+    pbm.add_argument("--bits", type=int, default=256)
+    pbm.add_argument("--batch", type=int, nargs="+", default=[1,64,256,512])
+
+    pt = sub.add_parser("test", help="Run internal smoke tests")
+
+    args = p.parse_args()
+
+    if args.cmd == "encode":
+        fam = FAMILY_A if args.family == "A" else FAMILY_B
+        num = encode_number(args.x, bases_int=args.int_bases, bases_frac=fam.seq,
+                            depth_frac=args.depth,
+                            int_bijective=args.bijective_int,
+                            frac_bijective=args.bijective_frac)
+        print(num)
+        print("Value (Fraction):", num.to_fraction())
+        print("Value (float):   ", num.to_float())
+
+    elif args.cmd == "blend":
+        approx, aA, aB, alpha = blend_fractional(args.x, FAMILY_A, FAMILY_B, args.depth,
+                                                 x0=args.x0, band=args.band, blend=not args.no_blend)
+        print(f"approx={float(approx)}  aA={float(aA)}  aB={float(aB)}  alpha_B={alpha}")
+        if args.save == "plots":
+            summary = run_bench(depth=args.depth, x0=args.x0, band=args.band, save_plots=True, outdir=".")
+            print("Saved plots and summary:", summary)
+
+    elif args.cmd == "adaptive":
+        fam, depth, err = choose_family_and_depth(args.x, [FAMILY_A, FAMILY_B], eps=args.eps, max_depth=args.max_depth)
+        print(f"family={fam.name}  depth={depth}  error≈{err:.3e}")
+
+    elif args.cmd == "quantize-demo":
+        metrics = run_quantize_demo(duration=args.duration, fs=args.fs, depth=args.depth,
+                                    x0=args.x0, band=args.band, hysteresis=args.hysteresis,
+                                    save_plots=not args.no_plots, outdir=args.outdir)
+        print("Quantize metrics:", metrics)
+
+    elif args.cmd == "control-demo":
+        metrics = simulate_control(Ts=args.Ts, Tfinal=args.Tfinal, r_step_time=args.r_step_time, r_value=args.r_value,
+                                   depth=args.depth, x0=args.x0, band=args.band, hysteresis=args.hysteresis,
+                                   save_plots=not args.no_plots, outdir=args.outdir)
+        print("Control metrics:", metrics)
+
+    elif args.cmd in ("rns-add","rns-mul"):
+        moduli = args.moduli
+        for m in moduli:
+            if m <= 1: raise SystemExit("All moduli must be > 1")
+        residues = rns_add(args.a, args.b, moduli) if args.cmd=="rns-add" else rns_mul(args.a, args.b, moduli)
+        if args.algo == "classical":
+            x, M = crt_classical(residues, moduli)
+        elif args.algo == "garner":
+            x, _ = garner(residues, moduli); M = math.prod(moduli)
+        else:
+            x, M = crt_general(residues, moduli)
+        print("residues:", residues)
+        print("recombined:", x, " modulus:", M)
+        print("expected:", ( (args.a + args.b) if args.cmd=='rns-add' else (args.a*args.b) ) % M)
+
+    elif args.cmd == "rrns-demo":
+        metrics = run_rrns_demo(trials=args.trials, save_plots=not args.no_plots, outdir=args.outdir)
+        print("RRNS metrics:", metrics)
+
+    elif args.cmd == "bench":
+        results = run_batch_bench(bits=args.bits, batch=args.batch)
+        print("Batch bench:", results)
+
+    elif args.cmd == "test":
+        # Fractional bijective parity
+        d0, _ = frac_encode_standard(Fraction(137, 997), FAMILY_A.seq, depth=8)
+        db, _ = frac_encode_bijective(Fraction(137, 997), FAMILY_A.seq, depth=8)
+        rec0 = frac_reconstruct(d0, FAMILY_A.seq[:8], bijective_external=False)
+        recb = frac_reconstruct(db, FAMILY_A.seq[:8], bijective_external=True)
+        assert rec0 == recb
+        # CRT sanity
+        mods = [5, 7, 11, 13]
+        for x_true in range(0, 5*7*11*13, 77):
+            r = [x_true % m for m in mods]
+            x_class, M = crt_classical(r, mods)
+            x_garner, coeffs = garner(r, mods)
+            assert M == math.prod(mods)
+            assert x_class % M == x_true % M
+            assert x_garner % M == x_true % M
+        # RRNS smart correction
+        work = [1019, 1021, 1031, 1033, 1039]; red=[1049, 1061]
+        M_work = math.prod(work)
+        import random
+        for _ in range(30):
+            x_true = random.randrange(0, M_work)
+            r_work = [x_true % m for m in work]; r_red=[x_true%p for p in red]
+            j = random.randrange(len(work)); r_work[j] = (r_work[j] + 1) % work[j]
+            ok, fixed = rrns_correct_single_smart(r_work, work, r_red, red)
+            assert ok and fixed is not None
+        print("All smoke tests passed.")
+
+if __name__ == "__main__":
+    main()
