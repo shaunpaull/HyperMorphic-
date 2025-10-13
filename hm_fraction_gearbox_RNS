@@ -1,0 +1,537 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+HM Fraction Gearbox — Single-File Reference Implementation
+==========================================================
+
+This module implements a practical "HyperMorphic Fraction Gearbox":
+a mixed-radix, no-zero (bijective) capable number system with dynamic base
+scheduling and a C¹-like blended switch between base families.
+
+Core ideas
+----------
+1) Mixed-Radix Representation
+   A real number x is represented by two finite digit vectors under
+   *possibly different* base sequences for the integer and fractional parts:
+      x = sign * (  I(int_digits | bases_int) + F(frac_digits | bases_frac)  )
+   where I and F reconstruct integer and fractional values.
+
+2) Bijective / No-Zero Digits
+   Externally, digits can be 1..b (no zero); internally we compute with
+   standard 0..(b-1) digits using (external - 1).
+
+3) Exact Rationals
+   We use fractions.Fraction end-to-end to avoid FP drift for encoders/
+   reconstructors and the dynamic blend arithmetic.
+
+4) Dynamic Base Switch + Blend
+   Two base families A and B can be blended smoothly around a threshold x0
+   with a cubic smoothstep in a band of width 2*band. This avoids discrete
+   seams when changing base "gearings" mid-domain.
+
+5) Adaptive Scheduler
+   For a given x and target error ε, choose the family and minimal depth
+   that reaches ε (or the best available if not reached within max_depth).
+
+6) Minimal RNS-Style Integer Ops (Demo)
+   We demonstrate gearwise (mod-wise) integer addition and a simple brute-force
+   recombination within the dynamic range (product of moduli). This is for
+   pedagogy; serious use should adopt a CRT implementation.
+
+Usage
+-----
+  python hm_fraction_gearbox.py encode --x 0.314159 --family A --depth 8 --bijective-frac
+  python hm_fraction_gearbox.py blend --x 0.53 --depth 8 --x0 0.5 --band 0.08 --save plots
+  python hm_fraction_gearbox.py adaptive --x 0.73 --eps 1e-8
+  python hm_fraction_gearbox.py test --plots
+  python hm_fraction_gearbox.py rns-add --a 37 --b 16 --moduli 3 4 5
+"""
+
+from __future__ import annotations
+
+import argparse
+import math
+import os
+from dataclasses import dataclass
+from fractions import Fraction
+from typing import Iterable, List, Sequence, Tuple, Optional
+
+import numpy as np
+import matplotlib.pyplot as plt
+
+
+# ---------------------------------------------------------------------
+# Utilities
+# ---------------------------------------------------------------------
+
+def _clamp_fraction_unit(frac: Fraction) -> Fraction:
+    """Clamp into [0,1), strictly less than 1 to avoid edge issues."""
+    if frac < 0:
+        return Fraction(0, 1)
+    if frac >= 1:
+        # knock one tiny rational ULP: 10^12-1 / 10^12
+        return Fraction(10**12 - 1, 10**12)
+    return frac
+
+
+def _as_fraction_unit(x: float | Fraction) -> Fraction:
+    """Convert x to Fraction clamped to [0,1)."""
+    if isinstance(x, float):
+        # Avoid FP representation at 1.0 by stepping below 1.0
+        x = min(max(x, 0.0), math.nextafter(1.0, 0.0))
+        frac = Fraction.from_float(x).limit_denominator(10**9)
+    else:
+        frac = Fraction(x)
+    return _clamp_fraction_unit(frac)
+
+
+# ---------------------------------------------------------------------
+# Mixed-Radix: Fractional part (standard and bijective)
+# ---------------------------------------------------------------------
+
+def _greedy_fraction_digits(frac: Fraction, bases: Sequence[int], depth: Optional[int]) -> Tuple[List[int], Fraction]:
+    """
+    Greedy fractional mixed-radix digits for frac ∈ [0,1).
+    Returns (standard_digits, exact_approx_value).
+    Digit i is in 0..(b_i-1).  Approx value is sum(d_i / prod_j<=i b_j).
+    """
+    if not (Fraction(0) <= frac < Fraction(1)):
+        raise ValueError("frac must be in [0,1)")
+    k = len(bases) if depth is None else min(depth, len(bases))
+    r = Fraction(frac)
+    digits: List[int] = []
+    denom = Fraction(1)
+    approx = Fraction(0)
+    for i in range(k):
+        b = int(bases[i])
+        r *= b
+        d = int(r)  # floor since Fraction
+        if d >= b:  # guard for exact 1.0 after multiplication
+            d = b - 1
+        r -= d
+        digits.append(d)
+        denom *= b
+        approx += Fraction(d, denom)
+    return digits, approx
+
+
+def frac_encode_standard(x: float | Fraction, bases: Sequence[int], depth: Optional[int] = None) -> Tuple[List[int], Fraction]:
+    """Standard digits 0..(b-1)."""
+    frac = _as_fraction_unit(x)
+    return _greedy_fraction_digits(frac, bases, depth)
+
+
+def frac_encode_bijective(x: float | Fraction, bases: Sequence[int], depth: Optional[int] = None) -> Tuple[List[int], Fraction]:
+    """Bijective external digits 1..b_i; internally use (e_i-1)."""
+    d0, approx = frac_encode_standard(x, bases, depth)
+    return [d + 1 for d in d0], approx
+
+
+def frac_reconstruct(digits: Sequence[int], bases: Sequence[int], bijective_external: bool = False) -> Fraction:
+    """Reconstruct fractional value from digits and bases."""
+    k = min(len(digits), len(bases))
+    denom = Fraction(1)
+    s = Fraction(0)
+    for i in range(k):
+        b = int(bases[i])
+        d = int(digits[i])
+        if bijective_external:
+            d = d - 1
+        denom *= b
+        s += Fraction(d, denom)
+    return s
+
+
+# ---------------------------------------------------------------------
+# Mixed-Radix: Integer part (standard and bijective) for completeness
+# ---------------------------------------------------------------------
+
+def int_encode_standard(n: int, bases: Sequence[int]) -> List[int]:
+    """
+    Encode non-negative integer n into mixed-radix integer digits (MSD first).
+    Digits are standard 0..(b-1).
+    """
+    if n < 0:
+        raise ValueError("Use sign with negative integers")
+    if not bases:
+        return [0]
+    digits_rev: List[int] = []
+    x = n
+    for b in bases[::-1]:
+        q, r = divmod(x, b)
+        digits_rev.append(r)
+        x = q
+    digits = digits_rev[::-1]
+    return digits
+
+
+def int_reconstruct(digits: Sequence[int], bases: Sequence[int], bijective_external: bool = False) -> int:
+    """Reconstruct integer from digits and bases (MSD first)."""
+    if len(digits) != len(bases):
+        raise ValueError("Integer digits length must match bases length")
+    x = 0
+    for d, b in zip(digits, bases):
+        if bijective_external:
+            d = d - 1
+        if not (0 <= d < b):
+            raise ValueError("Digit out of range for base")
+        x = x * b + d
+    return x
+
+
+def int_encode_bijective(n: int, bases: Sequence[int]) -> List[int]:
+    """Bijective integer digits (1..b) derived from standard via +1."""
+    return [d + 1 for d in int_encode_standard(n, bases)]
+
+
+# ---------------------------------------------------------------------
+# HM Number (sign, integer digits, fractional digits)
+# ---------------------------------------------------------------------
+
+@dataclass
+class HMNumber:
+    sign: int                    # ±1
+    int_digits: List[int]        # MSD first (standard or bijective as flagged)
+    frac_digits: List[int]       # 1st after radix point to right (standard or bijective as flagged)
+    bases_int: List[int]
+    bases_frac: List[int]
+    int_bijective: bool = False
+    frac_bijective: bool = True  # default to bijective/no-zero for fractions
+
+    def to_fraction(self) -> Fraction:
+        ival = int_reconstruct(self.int_digits, self.bases_int, bijective_external=self.int_bijective) if self.int_digits else 0
+        fval = frac_reconstruct(self.frac_digits, self.bases_frac, bijective_external=self.frac_bijective) if self.frac_digits else Fraction(0)
+        return Fraction(self.sign, 1) * (Fraction(ival, 1) + fval)
+
+    def to_float(self) -> float:
+        return float(self.to_fraction())
+
+    def __str__(self) -> str:
+        si = "-" if self.sign < 0 else ""
+        idig = self.int_digits if self.int_digits else [0]
+        fdig = self.frac_digits if self.frac_digits else []
+        return f"{si}{idig}.{fdig}  (int_bij={self.int_bijective}, frac_bij={self.frac_bijective})"
+
+
+def encode_number(x: float | Fraction,
+                  bases_int: Sequence[int],
+                  bases_frac: Sequence[int],
+                  depth_frac: Optional[int] = None,
+                  int_bijective: bool = False,
+                  frac_bijective: bool = True) -> HMNumber:
+    """Encode general x into HMNumber with separate integer and fractional gearings."""
+    if isinstance(x, float):
+        xf = Fraction.from_float(x).limit_denominator(10**9)
+    else:
+        xf = Fraction(x)
+    sign = 1
+    if xf < 0:
+        sign = -1
+        xf = -xf
+    ival = int(xf)  # floor
+    fval = xf - ival
+    if int_bijective:
+        idigits = int_encode_bijective(ival, bases_int)
+    else:
+        idigits = int_encode_standard(ival, bases_int)
+    if frac_bijective:
+        fdigits, _ = frac_encode_bijective(fval, bases_frac, depth_frac)
+    else:
+        fdigits, _ = frac_encode_standard(fval, bases_frac, depth_frac)
+    return HMNumber(sign, idigits, fdigits, list(bases_int), list(bases_frac),
+                    int_bijective=int_bijective, frac_bijective=frac_bijective)
+
+
+# ---------------------------------------------------------------------
+# Dynamic switch + C¹-like blend for the fractional part
+# ---------------------------------------------------------------------
+
+def smoothstep(t: float) -> float:
+    if t <= 0.0: return 0.0
+    if t >= 1.0: return 1.0
+    return t * t * (3.0 - 2.0 * t)
+
+
+@dataclass
+class BaseFamily:
+    name: str
+    seq: List[int]
+
+
+def blend_fractional(x: float | Fraction,
+                     A: BaseFamily, B: BaseFamily,
+                     depth: int,
+                     x0: float = 0.5, band: float = 0.08,
+                     blend: bool = True) -> Tuple[Fraction, Fraction, Fraction, float]:
+    """
+    Approximate x∈[0,1) via A or B (depth digits), returning:
+      (approx, approx_A, approx_B, alpha_on_B)
+    If blend=True, cubic smoothstep blend on [x0-band, x0+band].
+    """
+    frac = _as_fraction_unit(x)
+    _, aA = frac_encode_standard(frac, A.seq, depth)
+    _, aB = frac_encode_standard(frac, B.seq, depth)
+    if not blend:
+        alpha = 0.0 if float(frac) < x0 else 1.0
+    else:
+        left, right = x0 - band, x0 + band
+        if float(frac) <= left: alpha = 0.0
+        elif float(frac) >= right: alpha = 1.0
+        else: alpha = smoothstep((float(frac) - left) / (right - left))
+    # exact rational convex combination
+    alphaF = Fraction.from_float(alpha)
+    approx = (Fraction(1, 1) - alphaF) * aA + alphaF * aB
+    return approx, aA, aB, alpha
+
+
+# ---------------------------------------------------------------------
+# Adaptive chooser (family + depth to hit ε)
+# ---------------------------------------------------------------------
+
+def _estimate_error(x: float | Fraction, bases: Sequence[int], depth: int) -> float:
+    _, approx = frac_encode_standard(x, bases, depth)
+    return abs(float(approx) - float(_as_fraction_unit(x)))
+
+
+def choose_family_and_depth(x: float | Fraction,
+                            families: Sequence[BaseFamily],
+                            eps: float = 1e-8,
+                            max_depth: int = 12) -> Tuple[BaseFamily, int, float]:
+    """Pick family and minimal depth achieving error <= eps; else best at max_depth."""
+    best: Optional[Tuple[BaseFamily, int, float]] = None
+    for fam in families:
+        for d in range(1, max_depth + 1):
+            e = _estimate_error(x, fam.seq, d)
+            if e <= eps:
+                if best is None or d < best[1] or (d == best[1] and e < best[2]):
+                    best = (fam, d, e)
+                break
+    if best is None:
+        cand = [(fam, max_depth, _estimate_error(x, fam.seq, max_depth)) for fam in families]
+        best = min(cand, key=lambda t: t[2])
+    return best
+
+
+# ---------------------------------------------------------------------
+# RNS-style integer demo ops (gearwise add + brute recombine)
+# ---------------------------------------------------------------------
+
+def rns_residues(n: int, moduli: Sequence[int]) -> List[int]:
+    return [n % m for m in moduli]
+
+
+def rns_add(a: int, b: int, moduli: Sequence[int]) -> List[int]:
+    return [ (ra + rb) % m for (ra, rb, m) in zip(rns_residues(a, moduli), rns_residues(b, moduli), moduli) ]
+
+
+def rns_recombine(residues: Sequence[int], moduli: Sequence[int]) -> int:
+    """Brute-force recombination within the dynamic range M=∏ moduli (for demo)."""
+    M = 1
+    for m in moduli: M *= m
+    for x in range(M):
+        if all((x % m) == r for m, r in zip(moduli, residues)):
+            return x
+    raise ValueError("No solution found in [0,M).")
+
+
+# ---------------------------------------------------------------------
+# Defaults for base families (you can tweak here)
+# ---------------------------------------------------------------------
+
+FAMILY_A = BaseFamily("A_small_increments", [3,5,7,9,11,13,15,17,19,21,23,25])
+FAMILY_B = BaseFamily("B_exponential",     [4,8,16,32,64,128,256,512,1024,2048,4096,8192])
+
+
+# ---------------------------------------------------------------------
+# Tests / Bench plots
+# ---------------------------------------------------------------------
+
+def run_bench(depth: int = 8, x0: float = 0.5, band: float = 0.08, save_plots: bool = True, outdir: str = ".") -> dict:
+    N = 4000
+    xs = np.linspace(0.0, 1.0 - 1e-12, N)
+
+    approx_A = np.empty(N)
+    approx_B = np.empty(N)
+    approx_bl = np.empty(N)
+    approx_hd = np.empty(N)
+
+    for i, xf in enumerate(xs):
+        _, aA = frac_encode_standard(xf, FAMILY_A.seq, depth)
+        _, aB = frac_encode_standard(xf, FAMILY_B.seq, depth)
+        ab, *_ = blend_fractional(xf, FAMILY_A, FAMILY_B, depth, x0=x0, band=band, blend=True)
+        ah, *_ = blend_fractional(xf, FAMILY_A, FAMILY_B, depth, x0=x0, band=band, blend=False)
+        approx_A[i] = float(aA)
+        approx_B[i] = float(aB)
+        approx_bl[i] = float(ab)
+        approx_hd[i] = float(ah)
+
+    err_A = np.abs(approx_A - xs)
+    err_B = np.abs(approx_B - xs)
+    err_bl = np.abs(approx_bl - xs)
+    err_hd = np.abs(approx_hd - xs)
+
+    dx = xs[1] - xs[0]
+    der_bl = np.gradient(approx_bl, dx)
+    der_hd = np.gradient(approx_hd, dx)
+
+    mask = (xs >= (x0 - band)) & (xs <= (x0 + band))
+
+    summary = {
+        "depth": depth,
+        "x0": x0,
+        "band": band,
+        "max_abs_error_A": float(np.max(err_A)),
+        "max_abs_error_B": float(np.max(err_B)),
+        "max_abs_error_blended": float(np.max(err_bl)),
+        "max_abs_error_hard": float(np.max(err_hd)),
+        "max_derivative_in_band_blended": float(np.max(np.abs(der_bl[mask]))),
+        "max_derivative_in_band_hard": float(np.max(np.abs(der_hd[mask]))),
+    }
+
+    # Plot 1: error curves
+    plt.figure(figsize=(10,5))
+    plt.plot(xs, err_A, label="Error A")
+    plt.plot(xs, err_B, label="Error B")
+    plt.plot(xs, err_bl, label="Error Blended")
+    plt.plot(xs, err_hd, label="Error Hard-switch")
+    plt.xlabel("x")
+    plt.ylabel("absolute error |approx(x) − x|")
+    plt.title("HM Fraction Gearbox — Error vs x")
+    plt.legend()
+    plt.tight_layout()
+    if save_plots:
+        f1 = os.path.join(outdir, "hm_fraction_gearbox_errors.png")
+        plt.savefig(f1, dpi=160)
+    plt.close()
+
+    # Plot 2: derivative behavior near the seam
+    plt.figure(figsize=(10,5))
+    plt.plot(xs, der_hd, label="d/dx Hard-switch")
+    plt.plot(xs, der_bl, label="d/dx Blended")
+    plt.xlabel("x")
+    plt.ylabel("approx derivative")
+    plt.title("HM Fraction Gearbox — Derivative (Hard vs Blended)")
+    plt.legend()
+    plt.tight_layout()
+    if save_plots:
+        f2 = os.path.join(outdir, "hm_fraction_gearbox_derivatives.png")
+        plt.savefig(f2, dpi=160)
+    plt.close()
+
+    return summary
+
+
+def run_tests(verbose: bool = True, plots: bool = False) -> None:
+    # Bijective parity for fractions
+    xs = [Fraction(n, 997) for n in range(0, 997, 37)]
+    max_delta = 0.0
+    for x in xs:
+        d0, a0 = frac_encode_standard(x, FAMILY_A.seq, depth=8)
+        db, ab = frac_encode_bijective(x, FAMILY_A.seq, depth=8)
+        rec0 = frac_reconstruct(d0, FAMILY_A.seq[:8], bijective_external=False)
+        recb = frac_reconstruct(db, FAMILY_A.seq[:8], bijective_external=True)
+        max_delta = max(max_delta, float(abs(rec0 - recb)))
+    if verbose:
+        print("Bijective parity (fractional) max delta:", max_delta)
+
+    # HMNumber encode/decode roundtrip
+    num = encode_number(-123.456, bases_int=[10,10,10], bases_frac=FAMILY_B.seq, depth_frac=8,
+                        int_bijective=False, frac_bijective=True)
+    if verbose:
+        print("Encoded HMNumber:", num)
+        print("Roundtrip value:", float(num.to_fraction()))
+
+    # RNS demo
+    moduli = [3, 4, 5]
+    a, b = 37, 16
+    s_res = rns_add(a, b, moduli)
+    s_val = rns_recombine(s_res, moduli)
+    if verbose:
+        print("RNS add residues:", s_res, "-> recombined:", s_val, "(expected:", (a + b) % (3*4*5), ")")
+
+    # Bench/plots
+    if plots:
+        summary = run_bench(depth=8, x0=0.5, band=0.08, save_plots=True, outdir=".")
+        if verbose:
+            print("Bench summary:", summary)
+
+
+# ---------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------
+
+def main():
+    p = argparse.ArgumentParser(description="HM Fraction Gearbox — dynamic mixed-radix with C¹ blend")
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    # encode
+    pe = sub.add_parser("encode", help="Encode a real number into HM representation")
+    pe.add_argument("--x", type=float, required=True, help="value to encode")
+    pe.add_argument("--depth", type=int, default=8, help="fractional depth (digits)")
+    pe.add_argument("--family", choices=["A","B"], default="B", help="fraction base family")
+    pe.add_argument("--int-bases", type=int, nargs="*", default=[10,10,10], help="integer bases (MSD first)")
+    pe.add_argument("--bijective-frac", action="store_true", help="use bijective digits for fraction")
+    pe.add_argument("--bijective-int", action="store_true", help="use bijective digits for integer")
+
+    # blend
+    pb = sub.add_parser("blend", help="Blend A/B families for fractional x with C¹ smoothstep")
+    pb.add_argument("--x", type=float, required=True)
+    pb.add_argument("--depth", type=int, default=8)
+    pb.add_argument("--x0", type=float, default=0.5)
+    pb.add_argument("--band", type=float, default=0.08)
+    pb.add_argument("--no-blend", action="store_true")
+    pb.add_argument("--save", choices=["none","plots"], default="plots")
+
+    # adaptive
+    pa = sub.add_parser("adaptive", help="Choose family+depth for target error ε")
+    pa.add_argument("--x", type=float, required=True)
+    pa.add_argument("--eps", type=float, default=1e-8)
+    pa.add_argument("--max-depth", type=int, default=12)
+
+    # rns-add
+    pr = sub.add_parser("rns-add", help="RNS-style gearwise integer add + recombine (demo)")
+    pr.add_argument("--a", type=int, required=True)
+    pr.add_argument("--b", type=int, required=True)
+    pr.add_argument("--moduli", type=int, nargs="+", required=True)
+
+    # test
+    pt = sub.add_parser("test", help="Run internal tests; optionally generate plots")
+    pt.add_argument("--plots", action="store_true")
+
+    args = p.parse_args()
+
+    if args.cmd == "encode":
+        fam = FAMILY_A if args.family == "A" else FAMILY_B
+        num = encode_number(args.x, bases_int=args.int_bases, bases_frac=fam.seq,
+                            depth_frac=args.depth,
+                            int_bijective=args.bijective_int,
+                            frac_bijective=args.bijective_frac)
+        print(num)
+        print("Value (Fraction):", num.to_fraction())
+        print("Value (float):   ", num.to_float())
+
+    elif args.cmd == "blend":
+        approx, aA, aB, alpha = blend_fractional(args.x, FAMILY_A, FAMILY_B, args.depth,
+                                                 x0=args.x0, band=args.band, blend=not args.no_blend)
+        print(f"approx={float(approx)}  aA={float(aA)}  aB={float(aB)}  alpha_B={alpha}")
+        if args.save == "plots":
+            summary = run_bench(depth=args.depth, x0=args.x0, band=args.band, save_plots=True, outdir=".")
+            print("Saved plots and summary:", summary)
+
+    elif args.cmd == "adaptive":
+        fam, depth, err = choose_family_and_depth(args.x, [FAMILY_A, FAMILY_B], eps=args.eps, max_depth=args.max_depth)
+        print(f"family={fam.name}  depth={depth}  error≈{err:.3e}")
+
+    elif args.cmd == "rns-add":
+        res = rns_add(args.a, args.b, args.moduli)
+        recomb = rns_recombine(res, args.moduli)
+        M = 1
+        for m in args.moduli: M *= m
+        print("residues:", res)
+        print("recombined:", recomb, " expected:", (args.a + args.b) % M)
+
+    elif args.cmd == "test":
+        run_tests(verbose=True, plots=args.plots)
+
+if __name__ == "__main__":
+    main()
