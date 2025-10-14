@@ -1,0 +1,852 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+HyperMorphic Gearbox — Advanced Suite (Single File, No Dependencies)
+====================================================================
+
+This file implements an **advanced** HyperMorphic (HM) dynamic base/modulus system with:
+- Core arithmetic: dynamic base b(d) and dynamic modulus m(d)
+- General pipeline: pure-multiply and affine (with per-stage offsets)
+- Reverse algorithms with rigorous checks
+- Builders:
+    * Lossless divisibility-chain builder
+    * Adaptive chain builder
+    * Non-chain coprime-growth builder (moduli increase but need not divide)
+- Auditing & testing (sampling and full enumeration)
+- CLI with subcommands
+- Embedded PROOFS (Markdown) and README generator
+
+Design goals
+------------
+- Single-file, no third-party dependencies
+- Deterministic, reproducible, explicit
+- Extensible: you can swap b(d), m(d) if you want to experiment
+
+Quick start (CLI)
+-----------------
+  python hmgearbox_advanced.py build-lossless --k 6 --m-start 9 --multiplier 3 --out lossless.json
+  python hmgearbox_advanced.py run --dims-from-file lossless.json --trials 600
+  python hmgearbox_advanced.py build-nonchain --k 4 --m-start 6 --out nonchain.json
+  python hmgearbox_advanced.py run --dims-from-file nonchain.json --trials 600
+  python hmgearbox_advanced.py run-affine --dims-from-file lossless.json --offsets 1 3 5 7 9 11 --trials 500
+  python hmgearbox_advanced.py audit --dims-from-file lossless.json --csv audit.csv
+  python hmgearbox_advanced.py proofs --out PROOFS.md
+  python hmgearbox_advanced.py gen-readme --out README.md
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import math
+import random
+import sys
+from dataclasses import dataclass
+from math import gcd
+from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+
+# =========================
+# Core HM arithmetic
+# =========================
+
+def b_of(d: int) -> int:
+    """
+    Dynamic base: b(d) = floor(log2 d) + 1  (defined for d >= 1).
+    No-zero guarantee: b(d) >= 1 for d>=1.
+    """
+    if d < 1:
+        raise ValueError("b_of: d must be >= 1")
+    return int(math.log2(d)) + 1
+
+def m_of(d: int) -> int:
+    """
+    Dynamic modulus: m(d) = floor(sqrt d) + 1  (defined for d >= 0).
+    No-zero guarantee: m(d) >= 1 for d>=0.
+    """
+    if d < 0:
+        raise ValueError("m_of: d must be >= 0")
+    return math.isqrt(d) + 1
+
+def inv_mod(a: int, m: int) -> Optional[int]:
+    """
+    Multiplicative inverse of a modulo m, or None if gcd(a, m) != 1.
+    (Extended Euclidean Algorithm)
+    """
+    if m <= 0:
+        raise ValueError("inv_mod: modulus m must be positive")
+    a %= m
+    if gcd(a, m) != 1:
+        return None
+    t, new_t = 0, 1
+    r, new_r = m, a
+    while new_r != 0:
+        q = r // new_r
+        t, new_t = new_t, t - q * new_t
+        r, new_r = new_r, r - q * new_r
+    return t % m
+
+# =========================
+# Data classes for tracing
+# =========================
+
+@dataclass
+class StageTrace:
+    i: int
+    d: int
+    b: int
+    m: int
+    c: int
+    t: int
+
+# =========================
+# Forward / Reverse (pure + affine)
+# =========================
+
+def forward(v: int, dims: Sequence[int]) -> Tuple[int, Dict]:
+    """
+    Forward HM pipeline (pure multiply). Returns (t_k, info).
+    """
+    t = v
+    trace: List[Dict] = []
+    for i, d in enumerate(dims):
+        b_i, m_i = b_of(d), m_of(d)
+        t = (b_i * t) % m_i
+        trace.append({"i": i, "d": d, "b": b_i, "m": m_i, "c": 0, "t": t})
+    return t, {"trace": trace}
+
+def forward_affine(v: int, dims: Sequence[int], offsets: Sequence[int]) -> Tuple[int, Dict]:
+    """
+    Forward HM pipeline (affine): t_i = (b_i * t_{i-1} + c_i) mod m_i
+    Offsets length must equal len(dims).
+    """
+    if len(offsets) != len(dims):
+        raise ValueError("forward_affine: len(offsets) must equal len(dims)")
+    t = v
+    trace: List[Dict] = []
+    for i, (d, c_i) in enumerate(zip(dims, offsets)):
+        b_i, m_i = b_of(d), m_of(d)
+        t = (b_i * t + (c_i % m_i)) % m_i
+        trace.append({"i": i, "d": d, "b": b_i, "m": m_i, "c": int(c_i % m_i), "t": t})
+    return t, {"trace": trace}
+
+def reverse(tk: int, dims: Sequence[int]) -> Tuple[Optional[int], Dict]:
+    """
+    Reverse HM pipeline (pure multiply). Returns (v_hat, info).
+    If any stage is non-invertible (gcd(b_i, m_i) != 1), returns (None, info).
+    """
+    if not dims:
+        return tk, {"ok": True, "trace": []}
+    Bs = [b_of(d) for d in dims]
+    Ms = [m_of(d) for d in dims]
+    t = tk
+    rev_trace: List[Dict] = []
+    for i in range(len(dims) - 1, -1, -1):
+        b_i, m_i = Bs[i], Ms[i]
+        inv_b = inv_mod(b_i, m_i)
+        if inv_b is None:
+            return None, {
+                "ok": False,
+                "stage": i,
+                "reason": "gcd(b_i, m_i) != 1 (no multiplicative inverse)",
+                "trace": list(reversed(rev_trace)),
+            }
+        t_prev = (inv_b * (t % m_i)) % m_i
+        rev_trace.append({"i": i, "b": b_i, "m": m_i, "inv_b": inv_b, "t_prev": t_prev})
+        if i > 0:
+            t = t_prev % Ms[i - 1]
+        else:
+            return t_prev, {"ok": True, "trace": list(reversed(rev_trace))}
+    return None, {"ok": False, "reason": "unexpected flow"}
+
+def reverse_affine(tk: int, dims: Sequence[int], offsets: Sequence[int]) -> Tuple[Optional[int], Dict]:
+    """
+    Reverse HM pipeline (affine). Returns (v_hat, info).
+    """
+    if len(offsets) != len(dims):
+        raise ValueError("reverse_affine: len(offsets) must equal len(dims)")
+    if not dims:
+        return tk, {"ok": True, "trace": []}
+    Bs = [b_of(d) for d in dims]
+    Ms = [m_of(d) for d in dims]
+    t = tk
+    rev_trace: List[Dict] = []
+    for i in range(len(dims) - 1, -1, -1):
+        b_i, m_i, c_i = Bs[i], Ms[i], int(offsets[i] % Ms[i])
+        inv_b = inv_mod(b_i, m_i)
+        if inv_b is None:
+            return None, {
+                "ok": False,
+                "stage": i,
+                "reason": "gcd(b_i, m_i) != 1 (no multiplicative inverse)",
+                "trace": list(reversed(rev_trace)),
+            }
+        t_prev = (inv_b * ((t - c_i) % m_i)) % m_i
+        rev_trace.append({"i": i, "b": b_i, "m": m_i, "c": c_i, "inv_b": inv_b, "t_prev": t_prev})
+        if i > 0:
+            t = t_prev % Ms[i - 1]
+        else:
+            return t_prev, {"ok": True, "trace": list(reversed(rev_trace))}
+    return None, {"ok": False, "reason": "unexpected flow"}
+
+# =========================
+# Conditions & metrics
+# =========================
+
+def stage_invertible(d: int) -> bool:
+    return gcd(b_of(d), m_of(d)) == 1
+
+def pipeline_conditions(dims: Sequence[int]) -> Dict:
+    Bs = [b_of(d) for d in dims]
+    Ms = [m_of(d) for d in dims]
+    per_stage = [gcd(Bs[i], Ms[i]) == 1 for i in range(len(dims))]
+    chain = all(Ms[i + 1] % Ms[i] == 0 for i in range(len(Ms) - 1)) if Ms else True
+    nondecreasing = all(Ms[i + 1] >= Ms[i] for i in range(len(Ms) - 1)) if Ms else True
+    return {
+        "Bs": Bs,
+        "Ms": Ms,
+        "per_stage_invertible": per_stage,
+        "divisibility_chain": chain,
+        "nondecreasing_moduli": nondecreasing,
+    }
+
+def image_size_stage(d: int) -> int:
+    b, m = b_of(d), m_of(d)
+    return m // gcd(b, m)
+
+# =========================
+# Builders
+# =========================
+
+def d_range_for_m(m: int) -> Tuple[int, int]:
+    if m < 1:
+        raise ValueError("d_range_for_m: m must be >= 1")
+    return (m - 1) * (m - 1), m * m - 1
+
+def find_d_for_mod_with_coprime_b(m: int, sample_stride: int = 4000) -> Optional[int]:
+    """
+    Find d with m(d)=m and gcd(b(d), m)=1.
+    """
+    lo, hi = d_range_for_m(m)
+    L = hi - lo + 1
+    step = max(1, L // max(1, sample_stride))
+    for d in range(lo, hi + 1, step):
+        if gcd(b_of(d), m) == 1:
+            return d
+    for d in range(lo, hi + 1):
+        if gcd(b_of(d), m) == 1:
+            return d
+    return None
+
+def build_lossless_dims(k: int, m_start: int, multiplier: int) -> List[int]:
+    """
+    Build k dimensions ensuring chain m1|...|mk and per-stage gcd(b_i,m_i)=1.
+    """
+    if k <= 0:
+        raise ValueError("k must be positive")
+    if m_start < 1 or multiplier < 1:
+        raise ValueError("m_start and multiplier must be >= 1")
+
+    dims: List[int] = []
+    m = m_start
+    for _ in range(k):
+        d = find_d_for_mod_with_coprime_b(m)
+        if d is None:
+            raise RuntimeError(f"No suitable d for m={m} in its bucket")
+        dims.append(d)
+        m *= multiplier
+
+    Ms = [m_of(d) for d in dims]
+    Bs = [b_of(d) for d in dims]
+    if not all(Ms[i + 1] % Ms[i] == 0 for i in range(len(Ms) - 1)):
+        raise RuntimeError("Divisibility chain failed.")
+    if not all(gcd(Bs[i], Ms[i]) == 1 for i in range(len(Ms))):
+        raise RuntimeError("Coprimality failed.")
+    return dims
+
+def build_adaptive_dims(k: int, m_start: int, mult_choices: Sequence[int] = (3, 2, 4, 5, 6, 7)) -> Tuple[List[int], List[int]]:
+    """
+    Build k dimensions with an adaptive chain.
+    Returns (dims, ms).
+    """
+    if k <= 0:
+        raise ValueError("k must be positive")
+    if m_start < 1:
+        raise ValueError("m_start must be >= 1")
+    if not mult_choices:
+        raise ValueError("mult_choices must be non-empty")
+
+    dims: List[int] = []
+    ms: List[int] = []
+    m = m_start
+    for i in range(k):
+        d = find_d_for_mod_with_coprime_b(m)
+        if d is None:
+            base = ms[-1] if ms else m_start
+            found = False
+            for mult in mult_choices:
+                m2 = base * mult
+                d2 = find_d_for_mod_with_coprime_b(m2)
+                if d2 is not None:
+                    m = m2
+                    d = d2
+                    found = True
+                    break
+            if not found:
+                raise RuntimeError(f"adaptive: failed to realize stage {i+1}")
+        dims.append(d); ms.append(m)
+        m = m * mult_choices[0]
+
+    if not all(ms[i + 1] % ms[i] == 0 for i in range(len(ms) - 1)):
+        raise RuntimeError("Divisibility chain failed (adaptive).")
+    if not all(gcd(b_of(dims[i]), ms[i]) == 1 for i in range(len(ms))):
+        raise RuntimeError("Coprime check failed (adaptive).")
+    return dims, ms
+
+# --- Non-chain builder (heuristic): increasing moduli, not necessarily dividing ---
+
+def next_coprime_at_least(n: int, forbid_small_factors: Sequence[int] = (2,)) -> int:
+    """
+    Return the smallest integer >= n that is coprime to all numbers in forbid_small_factors.
+    This is a simple heuristic to avoid obvious factor clashes.
+    """
+    x = max(2, n)
+    while True:
+        ok = True
+        for f in forbid_small_factors:
+            if math.gcd(x, f) != 1 and f != 1:
+                ok = False; break
+        if ok:
+            return x
+        x += 1
+
+def build_nonchain_dims(k: int, m_start: int, growth: int = 3, forbid_factors: Sequence[int] = ()):
+    """
+    Build k dimensions where moduli are non-decreasing (typically increasing), but *no* divisibility is required.
+    Strategy:
+      - Start at m_start
+      - Increase by 'growth' each step (or more, to ensure gcd(b(d), m)=1 is achievable)
+      - Optionally avoid forbidden small factors in modulus via next_coprime_at_least
+    Returns dims.
+    """
+    if k <= 0:
+        raise ValueError("k must be positive")
+    if m_start < 1:
+        raise ValueError("m_start must be >= 1")
+
+    dims: List[int] = []
+    m = m_start
+    for i in range(k):
+        if forbid_factors:
+            m = next_coprime_at_least(m, forbid_factors)
+        d = find_d_for_mod_with_coprime_b(m)
+        # If the bucket is bad (rare), bump m minimally
+        bump = 1
+        while d is None and bump < 50:  # conservative cap
+            m += 1
+            if forbid_factors:
+                m = next_coprime_at_least(m, forbid_factors)
+            d = find_d_for_mod_with_coprime_b(m)
+            bump += 1
+        if d is None:
+            raise RuntimeError(f"nonchain: could not find invertible stage for some m near {m}")
+        dims.append(d)
+        # grow for next step
+        m = max(m + growth, m + 1)
+    return dims
+
+# =========================
+# Analysis & testing
+# =========================
+
+def test_exact_recovery(dims: Sequence[int], trials: int = 500, seed: Optional[int] = None, affine_offsets: Optional[Sequence[int]] = None) -> Dict:
+    if seed is not None:
+        random.seed(seed)
+    Ms = [m_of(d) for d in dims]
+    ok = 0
+    for _ in range(trials):
+        v = random.randint(0, Ms[0] - 1) if Ms else 0
+        if affine_offsets is None:
+            t, _ = forward(v, dims)
+            vhat, _ = reverse(t, dims)
+        else:
+            t, _ = forward_affine(v, dims, affine_offsets)
+            vhat, _ = reverse_affine(t, dims, affine_offsets)
+        ok += int(vhat == v)
+    conds = pipeline_conditions(dims)
+    return {
+        "trials": trials,
+        "exact_rate": (ok / trials) if trials else 1.0,
+        "per_stage_invertible": conds["per_stage_invertible"],
+        "divisibility_chain": conds["divisibility_chain"],
+        "nondecreasing_moduli": conds["nondecreasing_moduli"],
+        "Ms": conds["Ms"],
+        "Bs": conds["Bs"],
+    }
+
+def full_enumeration_recovery(dims: Sequence[int], limit: int = 20000, affine_offsets: Optional[Sequence[int]] = None) -> Dict:
+    if not dims:
+        return {"domain_size_tested": 1, "exact_count": 1, "exact_rate": 1.0, "full": True}
+    m1 = m_of(dims[0])
+    full = (m1 <= limit)
+    tested = m1 if full else min(m1, limit)
+    exact = 0
+    for v in range(tested):
+        if affine_offsets is None:
+            t, _ = forward(v, dims)
+            vhat, _ = reverse(t, dims)
+        else:
+            t, _ = forward_affine(v, dims, affine_offsets)
+            vhat, _ = reverse_affine(t, dims, affine_offsets)
+        if vhat == v:
+            exact += 1
+    return {
+        "domain_size_tested": tested,
+        "exact_count": exact,
+        "exact_rate": exact / tested if tested else 1.0,
+        "full": full,
+    }
+
+def audit_table(dims: Sequence[int]) -> List[Dict]:
+    rows: List[Dict] = []
+    for i, d in enumerate(dims, start=1):
+        b, m = b_of(d), m_of(d)
+        g = gcd(b, m)
+        rows.append({
+            "stage": i,
+            "d": d,
+            "b(d)": b,
+            "m(d)": m,
+            "gcd(b,m)": g,
+            "image_size": m // g,
+            "invertible": (g == 1),
+        })
+    return rows
+
+# =========================
+# CLI utilities
+# =========================
+
+def _read_dims_from_file(path: str) -> List[int]:
+    with open(path, "r", encoding="utf-8") as f:
+        obj = json.load(f)
+    if isinstance(obj, dict) and "dims" in obj:
+        return list(map(int, obj["dims"]))
+    if isinstance(obj, list):
+        return list(map(int, obj))
+    raise ValueError("Unrecognized dims file format (expect a list or an object with 'dims').")
+
+def _maybe_write_json(obj: Dict, out: Optional[str]) -> None:
+    if out:
+        with open(out, "w", encoding="utf-8") as f:
+            json.dump(obj, f, indent=2)
+        print(f"Wrote {out}")
+
+def _maybe_write_csv(rows: List[Dict], csv_path: Optional[str]) -> None:
+    if not csv_path:
+        return
+    import csv
+    keys = list(rows[0].keys()) if rows else []
+    with open(csv_path, "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=keys)
+        w.writeheader()
+        for r in rows:
+            w.writerow(r)
+    print(f"Wrote {csv_path}")
+
+def _print_json(obj: Dict) -> None:
+    print(json.dumps(obj, indent=2))
+
+# =========================
+# CLI commands
+# =========================
+
+def cmd_run(args: argparse.Namespace) -> None:
+    if args.dims_from_file:
+        dims = _read_dims_from_file(args.dims_from_file)
+    elif args.dims:
+        dims = list(map(int, args.dims))
+    else:
+        raise SystemExit("Please provide --dims ... or --dims-from-file FILE.json")
+
+    res = test_exact_recovery(dims, trials=args.trials, seed=args.seed)
+    if args.full_enum:
+        res["full_enum"] = full_enumeration_recovery(dims, limit=args.enum_limit)
+    _print_json({"dims": dims, **res})
+    _maybe_write_json({"dims": dims, **res}, args.out)
+
+def cmd_run_affine(args: argparse.Namespace) -> None:
+    if args.dims_from_file:
+        dims = _read_dims_from_file(args.dims_from_file)
+    elif args.dims:
+        dims = list(map(int, args.dims))
+    else:
+        raise SystemExit("Please provide --dims ... or --dims-from-file FILE.json")
+    if args.offsets is None or len(args.offsets) != len(dims):
+        raise SystemExit("run-affine: --offsets must be provided and match len(dims)")
+
+    res = test_exact_recovery(dims, trials=args.trials, seed=args.seed, affine_offsets=args.offsets)
+    if args.full_enum:
+        res["full_enum"] = full_enumeration_recovery(dims, limit=args.enum_limit, affine_offsets=args.offsets)
+    _print_json({"dims": dims, "offsets": args.offsets, **res})
+    _maybe_write_json({"dims": dims, "offsets": args.offsets, **res}, args.out)
+
+def cmd_forward(args: argparse.Namespace) -> None:
+    if args.dims_from_file:
+        dims = _read_dims_from_file(args.dims_from_file)
+    elif args.dims:
+        dims = list(map(int, args.dims))
+    else:
+        raise SystemExit("Please provide --dims ... or --dims-from-file FILE.json")
+
+    t, info = forward(args.v, dims)
+    _print_json({"v": args.v, "t": t, "trace": info["trace"]})
+
+def cmd_forward_affine(args: argparse.Namespace) -> None:
+    if args.dims_from_file:
+        dims = _read_dims_from_file(args.dims_from_file)
+    elif args.dims:
+        dims = list(map(int, args.dims))
+    else:
+        raise SystemExit("Please provide --dims ... or --dims-from-file FILE.json")
+    if args.offsets is None or len(args.offsets) != len(dims):
+        raise SystemExit("forward-affine: --offsets must match len(dims)")
+    t, info = forward_affine(args.v, dims, args.offsets)
+    _print_json({"v": args.v, "t": t, "trace": info["trace"]})
+
+def cmd_reverse(args: argparse.Namespace) -> None:
+    if args.dims_from_file:
+        dims = _read_dims_from_file(args.dims_from_file)
+    elif args.dims:
+        dims = list(map(int, args.dims))
+    else:
+        raise SystemExit("Please provide --dims ... or --dims-from-file FILE.json")
+
+    vhat, info = reverse(args.tk, dims)
+    _print_json({"tk": args.tk, "v_hat": vhat, **info})
+
+def cmd_reverse_affine(args: argparse.Namespace) -> None:
+    if args.dims_from_file:
+        dims = _read_dims_from_file(args.dims_from_file)
+    elif args.dims:
+        dims = list(map(int, args.dims))
+    else:
+        raise SystemExit("Please provide --dims ... or --dims-from-file FILE.json")
+    if args.offsets is None or len(args.offsets) != len(dims):
+        raise SystemExit("reverse-affine: --offsets must match len(dims)")
+    vhat, info = reverse_affine(args.tk, dims, args.offsets)
+    _print_json({"tk": args.tk, "v_hat": vhat, **info})
+
+def cmd_build_lossless(args: argparse.Namespace) -> None:
+    dims = build_lossless_dims(args.k, args.m_start, args.multiplier)
+    obj = {"dims": dims, "Bs": [b_of(d) for d in dims], "Ms": [m_of(d) for d in dims]}
+    _print_json(obj)
+    _maybe_write_json(obj, args.out)
+
+def cmd_build_adaptive(args: argparse.Namespace) -> None:
+    dims, ms = build_adaptive_dims(args.k, args.m_start)
+    obj = {"dims": dims, "Ms": ms, "Bs": [b_of(d) for d in dims]}
+    _print_json(obj)
+    _maybe_write_json(obj, args.out)
+
+def cmd_build_nonchain(args: argparse.Namespace) -> None:
+    dims = build_nonchain_dims(args.k, args.m_start, growth=args.growth, forbid_factors=tuple(args.forbid_factors or ()))
+    obj = {"dims": dims, "Bs": [b_of(d) for d in dims], "Ms": [m_of(d) for d in dims]}
+    _print_json(obj)
+    _maybe_write_json(obj, args.out)
+
+def cmd_audit(args: argparse.Namespace) -> None:
+    if args.dims_from_file:
+        dims = _read_dims_from_file(args.dims_from_file)
+    elif args.dims:
+        dims = list(map(int, args.dims))
+    else:
+        raise SystemExit("Please provide --dims ... or --dims-from-file FILE.json")
+
+    rows = audit_table(dims)
+    conds = pipeline_conditions(dims)
+    report = {
+        "dims": dims,
+        "Bs": conds["Bs"],
+        "Ms": conds["Ms"],
+        "per_stage_invertible": conds["per_stage_invertible"],
+        "divisibility_chain": conds["divisibility_chain"],
+        "nondecreasing_moduli": conds["nondecreasing_moduli"],
+        "stages": rows,
+    }
+    _print_json(report)
+    _maybe_write_csv(rows, args.csv)
+    _maybe_write_json(report, args.out)
+
+def cmd_proofs(args: argparse.Namespace) -> None:
+    if args.out:
+        with open(args.out, "w", encoding="utf-8") as f:
+            f.write(PROOFS)
+        print(f"Wrote {args.out}")
+    else:
+        print(PROOFS)
+
+def cmd_gen_readme(args: argparse.Namespace) -> None:
+    content = README_MD
+    if args.out:
+        with open(args.out, "w", encoding="utf-8") as f:
+            f.write(content)
+        print(f"Wrote {args.out}")
+    else:
+        print(content)
+
+# =========================
+# CLI parser
+# =========================
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        prog="hmgearbox_advanced",
+        description="HyperMorphic Gearbox — Advanced dynamic base/modulus transforms (pure + affine)",
+    )
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    # run (pure)
+    prun = sub.add_parser("run", help="Test exact recovery on a path (pure multiply)")
+    prun.add_argument("--dims", nargs="*", type=int, help="Dimensions d1 d2 ... dk")
+    prun.add_argument("--dims-from-file", help="JSON file with {'dims': [...]} or a raw list")
+    prun.add_argument("--trials", type=int, default=500)
+    prun.add_argument("--seed", type=int, default=None)
+    prun.add_argument("--full-enum", action="store_true", help="Enumerate full domain if feasible")
+    prun.add_argument("--enum-limit", type=int, default=20000)
+    prun.add_argument("--out", help="Save run result JSON to file")
+    prun.set_defaults(func=cmd_run)
+
+    # run-affine
+    prunA = sub.add_parser("run-affine", help="Test exact recovery on a path (affine)")
+    prunA.add_argument("--dims", nargs="*", type=int, help="Dimensions d1 d2 ... dk")
+    prunA.add_argument("--dims-from-file", help="JSON file with {'dims': [...]} or a raw list")
+    prunA.add_argument("--offsets", nargs="*", type=int, required=True, help="Offsets c1 c2 ... ck")
+    prunA.add_argument("--trials", type=int, default=500)
+    prunA.add_argument("--seed", type=int, default=None)
+    prunA.add_argument("--full-enum", action="store_true", help="Enumerate full domain if feasible")
+    prunA.add_argument("--enum-limit", type=int, default=20000)
+    prunA.add_argument("--out", help="Save run result JSON to file")
+    prunA.set_defaults(func=cmd_run_affine)
+
+    # forward / reverse
+    pfwd = sub.add_parser("forward", help="Run forward pipeline (pure)")
+    pfwd.add_argument("--dims", nargs="*", type=int)
+    pfwd.add_argument("--dims-from-file")
+    pfwd.add_argument("--v", type=int, required=True)
+    pfwd.set_defaults(func=cmd_forward)
+
+    pfwdA = sub.add_parser("forward-affine", help="Run forward pipeline (affine)")
+    pfwdA.add_argument("--dims", nargs="*", type=int)
+    pfwdA.add_argument("--dims-from-file")
+    pfwdA.add_argument("--offsets", nargs="*", type=int, required=True)
+    pfwdA.add_argument("--v", type=int, required=True)
+    pfwdA.set_defaults(func=cmd_forward_affine)
+
+    prev = sub.add_parser("reverse", help="Run reverse pipeline (pure)")
+    prev.add_argument("--dims", nargs="*", type=int)
+    prev.add_argument("--dims-from-file")
+    prev.add_argument("--tk", type=int, required=True)
+    prev.set_defaults(func=cmd_reverse)
+
+    prevA = sub.add_parser("reverse-affine", help="Run reverse pipeline (affine)")
+    prevA.add_argument("--dims", nargs="*", type=int)
+    prevA.add_argument("--dims-from-file")
+    prevA.add_argument("--offsets", nargs="*", type=int, required=True)
+    prevA.add_argument("--tk", type=int, required=True)
+    prevA.set_defaults(func=cmd_reverse_affine)
+
+    # builders
+    pbll = sub.add_parser("build-lossless", help="Build a lossless chain (m1|...|mk and all gcd=1)")
+    pbll.add_argument("--k", type=int, required=True)
+    pbll.add_argument("--m-start", type=int, required=True)
+    pbll.add_argument("--multiplier", type=int, required=True)
+    pbll.add_argument("--out", help="Write JSON to file")
+    pbll.set_defaults(func=cmd_build_lossless)
+
+    padp = sub.add_parser("build-adaptive", help="Build an adaptive lossless chain")
+    padp.add_argument("--k", type=int, required=True)
+    padp.add_argument("--m-start", type=int, required=True)
+    padp.add_argument("--out", help="Write JSON to file")
+    padp.set_defaults(func=cmd_build_adaptive)
+
+    pnon = sub.add_parser("build-nonchain", help="Build a non-chain path (increasing moduli, no divisibility needed)")
+    pnon.add_argument("--k", type=int, required=True)
+    pnon.add_argument("--m-start", type=int, required=True)
+    pnon.add_argument("--growth", type=int, default=3, help="Increment for next modulus (default 3)")
+    pnon.add_argument("--forbid-factors", nargs="*", type=int, help="Avoid moduli sharing factors with these")
+    pnon.add_argument("--out", help="Write JSON to file")
+    pnon.set_defaults(func=cmd_build_nonchain)
+
+    # audit
+    paud = sub.add_parser("audit", help="Stage-by-stage audit and conditions check")
+    paud.add_argument("--dims", nargs="*", type=int)
+    paud.add_argument("--dims-from-file")
+    paud.add_argument("--csv", help="Save stage audit as CSV")
+    paud.add_argument("--out", help="Save full audit JSON to file")
+    paud.set_defaults(func=cmd_audit)
+
+    # proofs & README
+    pprf = sub.add_parser("proofs", help="Print or save formal statements & proofs")
+    pprf.add_argument("--out", help="Write PROOFS to file")
+    pprf.set_defaults(func=cmd_proofs)
+
+    prd = sub.add_parser("gen-readme", help="Generate a README.md")
+    prd.add_argument("--out", help="Write README.md to file")
+    prd.set_defaults(func=cmd_gen_readme)
+
+    return p
+
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    args.func(args)
+    return 0
+
+# =========================
+# Embedded proofs (Markdown)
+# =========================
+
+PROOFS = r"""
+# Mathematical Proofs — HyperMorphic Gearbox (Advanced)
+
+We formalize the **HyperMorphic (HM)** pipeline and prove *when* it is reversible (lossless) and
+*when* it is compressive (non-invertible). All integers are understood modulo the given moduli.
+
+---
+
+## Definitions
+
+For a dimension parameter \(d \in \mathbb{Z}_{\ge 1}\), define
+\[
+b(d) = \lfloor \log_2 d \rfloor + 1, \qquad m(d) = \lfloor \sqrt{d} \rfloor + 1.
+\]
+
+A **stage** at dimension \(d\) is the map \(f_d : \mathbb{Z}_{m(d)} \to \mathbb{Z}_{m(d)}\) given by
+\[
+f_d(v) \equiv b(d)\,v \pmod{m(d)}.
+\]
+
+An **affine stage** uses a per-stage offset \(c(d)\in \mathbb{Z}_{m(d)}\) and is given by
+\[
+f_d(v) \equiv b(d)\,v + c(d) \pmod{m(d)}.
+\]
+
+A **pipeline** on a sequence of dimensions \(\mathbf{d}=(d_1,\dots,d_k)\) is the composition
+\(
+F = f_{d_k}\circ \cdots \circ f_{d_1}.
+\)
+When needed, write \(m_i = m(d_i)\), \(b_i = b(d_i)\), and \(t_i = f_{d_i}(t_{i-1})\) with \(t_0=v\).
+
+The **reverse step** (pure multiply) uses the multiplicative inverse \(b_i^{-1}\ (\mathrm{mod}\ m_i)\), when it exists, to recover
+\(t_{i-1}\) from \(t_i\) via \(t_{i-1} \equiv b_i^{-1} t_i\ (\mathrm{mod}\ m_i)\), then reduce to modulus \(m_{i-1}\).
+
+The **reverse step** (affine) subtracts \(c_i\) first and then inverts:
+\(
+t_{i-1} \equiv b_i^{-1}\,(t_i-c_i) \ (\mathrm{mod}\ m_i).
+\)
+
+---
+
+## Lemma 1 (Stage bijection)
+Let \(d\) be fixed. The map \(f_d(v) \equiv b(d)\,v\ (\mathrm{mod}\ m(d))\) is a bijection on \(\mathbb{Z}_{m(d)}\) **iff**
+\(\gcd\big(b(d), m(d)\big)=1\). The same holds for the affine stage \(v\mapsto b(d)v+c(d)\ \mathrm{mod}\ m(d)\).
+
+**Proof.** In \(\mathbb{Z}_{m(d)}\), multiplication by \(b(d)\) is invertible iff \(\gcd(b(d),m(d))=1\).
+For the affine case, first subtract \(c(d)\) then apply the same multiplicative inverse. \(\square\)
+
+---
+
+## Proposition 2 (Image size and compression factor)
+For any stage \(d\), \(|\mathrm{im}(f_d)| = \frac{m(d)}{\gcd(b(d), m(d))}\).
+If \(g=\gcd(b(d),m(d))>1\), then \(f_d\) is many-to-one with uniform fiber size \(g\). \(\square\)
+
+---
+
+## Theorem 3 (Pipeline recoverability without strict chains)
+Let \(\mathbf{d}=(d_1,\dots,d_k)\). Assume only that \(\gcd(b_i, m_i) = 1\) for all stages.
+If the moduli are **non-decreasing** \(m_1 \le m_2 \le \cdots \le m_k\), then the pipeline is injective on \( \mathbb{Z}_{m_1}\).
+The reverse algorithm (affine or pure) recovers \(v\) from \(t_k\) uniquely for all \(v\in \mathbb{Z}_{m_1}\).
+
+**Sketch.** Each stage is a permutation on \(\mathbb{Z}_{m_i}\). Forward propagation never shrinks the state-space
+below \(m_1\) if moduli are non-decreasing. Therefore the composite is injective on \( \mathbb{Z}_{m_1}\).
+The reverse algorithm recovers \(t_{i-1}\) uniquely in \(\mathbb{Z}_{m_i}\), and reduction to \(m_{i-1}\) is sound
+because \(t_{i-1}\) originated in \([0,m_{i-1}-1]\). \(\square\)
+
+---
+
+## Corollary 4 (Planned compression)
+If some stage has \(\gcd(b_i,m_i)>1\) or a later modulus is smaller than a previous one, the pipeline can be compressive.
+The image size collapses by at least the product of stage-by-stage factors \(m_i/\gcd(b_i,m_i)\) across the collapsing stages. \(\square\)
+
+---
+
+## Complexity (word-RAM model)
+
+- Forward pipeline (k stages): \(O(k)\) modular multiplies and reductions.
+- Affine adds one modular add per stage: still \(O(k)\).
+- Reverse: \(O(k)\) modular inversions (via extended Euclid) and reductions.
+- Full enumeration test: \(O(m_1 \cdot k)\).
+
+This matches empirical results from the included test harnesses.
+"""
+
+# =========================
+# Embedded README (Markdown)
+# =========================
+
+README_MD = r"""# HyperMorphic Gearbox — Advanced Suite
+
+Single-file, no-deps reference implementation of the **HyperMorphic (HM)** dynamic base/modulus pipeline:
+
+- Pure multiply and **affine** stages
+- Reversible pipelines (lossless) and planned compression (many-to-one)
+- Divisibility-chain **and** non-chain builders
+- Audit + test harnesses
+- CLI + embedded PROOFS and README generator
+
+## Install
+
+No install needed. Requires Python 3.8+.
+
+```bash
+python hmgearbox_advanced.py --help
+```
+
+## Quick Start
+
+```bash
+# 1) Lossless chain
+python hmgearbox_advanced.py build-lossless --k 6 --m-start 9 --multiplier 3 --out lossless.json
+python hmgearbox_advanced.py run --dims-from-file lossless.json --trials 600
+
+# 2) Non-chain (increasing moduli, no divisibility)
+python hmgearbox_advanced.py build-nonchain --k 4 --m-start 6 --growth 3 --out nonchain.json
+python hmgearbox_advanced.py run --dims-from-file nonchain.json --trials 600
+
+# 3) Affine version (provide offsets c_i)
+python hmgearbox_advanced.py run-affine --dims-from-file lossless.json --offsets 1 3 5 7 9 11 --trials 600
+
+# 4) Inspect stages
+python hmgearbox_advanced.py audit --dims-from-file lossless.json --csv audit.csv
+
+# 5) Save PROOFS and README
+python hmgearbox_advanced.py proofs --out PROOFS.md
+python hmgearbox_advanced.py gen-readme --out README.md
+```
+
+## Notes
+
+- **Invertibility:** Each stage must satisfy `gcd(b(d), m(d)) == 1`. The CLI builders guarantee this.
+- **Chains:** Divisibility chains (`m_i | m_{i+1}`) are convenient but not necessary for injectivity on the first modulus.
+  Non-decreasing moduli with per-stage coprimality suffice for injectivity.
+- **Compression:** If a stage violates coprimality or a modulus decreases, the pipeline intentionally compresses.
+
+See `PROOFS.md` for formal statements.
+"""
+
+# =========================
+# Entry point
+# =========================
+
+if __name__ == "__main__":
+    sys.setrecursionlimit(1000000)
+    sys.exit(main())
