@@ -850,3 +850,90 @@ See `PROOFS.md` for formal statements.
 if __name__ == "__main__":
     sys.setrecursionlimit(1000000)
     sys.exit(main())
+
+
+
+
+
+# Mathematical Proofs — HyperMorphic Gearbox (Advanced)
+
+We formalize the **HyperMorphic (HM)** pipeline and prove *when* it is reversible (lossless) and
+*when* it is compressive (non-invertible). All integers are understood modulo the given moduli.
+
+---
+
+## Definitions
+
+For a dimension parameter \(d \in \mathbb{Z}_{\ge 1}\), define
+\[
+b(d) = \lfloor \log_2 d \rfloor + 1, \qquad m(d) = \lfloor \sqrt{d} \rfloor + 1.
+\]
+
+A **stage** at dimension \(d\) is the map \(f_d : \mathbb{Z}_{m(d)} \to \mathbb{Z}_{m(d)}\) given by
+\[
+f_d(v) \equiv b(d)\,v \pmod{m(d)}.
+\]
+
+An **affine stage** uses a per-stage offset \(c(d)\in \mathbb{Z}_{m(d)}\) and is given by
+\[
+f_d(v) \equiv b(d)\,v + c(d) \pmod{m(d)}.
+\]
+
+A **pipeline** on a sequence of dimensions \(\mathbf{d}=(d_1,\dots,d_k)\) is the composition
+\(
+F = f_{d_k}\circ \cdots \circ f_{d_1}.
+\)
+When needed, write \(m_i = m(d_i)\), \(b_i = b(d_i)\), and \(t_i = f_{d_i}(t_{i-1})\) with \(t_0=v\).
+
+The **reverse step** (pure multiply) uses the multiplicative inverse \(b_i^{-1}\ (\mathrm{mod}\ m_i)\), when it exists, to recover
+\(t_{i-1}\) from \(t_i\) via \(t_{i-1} \equiv b_i^{-1} t_i\ (\mathrm{mod}\ m_i)\), then reduce to modulus \(m_{i-1}\).
+
+The **reverse step** (affine) subtracts \(c_i\) first and then inverts:
+\(
+t_{i-1} \equiv b_i^{-1}\,(t_i-c_i) \ (\mathrm{mod}\ m_i).
+\)
+
+---
+
+## Lemma 1 (Stage bijection)
+Let \(d\) be fixed. The map \(f_d(v) \equiv b(d)\,v\ (\mathrm{mod}\ m(d))\) is a bijection on \(\mathbb{Z}_{m(d)}\) **iff**
+\(\gcd\big(b(d), m(d)\big)=1\). The same holds for the affine stage \(v\mapsto b(d)v+c(d)\ \mathrm{mod}\ m(d)\).
+
+**Proof.** In \(\mathbb{Z}_{m(d)}\), multiplication by \(b(d)\) is invertible iff \(\gcd(b(d),m(d))=1\).
+For the affine case, first subtract \(c(d)\) then apply the same multiplicative inverse. \(\square\)
+
+---
+
+## Proposition 2 (Image size and compression factor)
+For any stage \(d\), \(|\mathrm{im}(f_d)| = \frac{m(d)}{\gcd(b(d), m(d))}\).
+If \(g=\gcd(b(d),m(d))>1\), then \(f_d\) is many-to-one with uniform fiber size \(g\). \(\square\)
+
+---
+
+## Theorem 3 (Pipeline recoverability without strict chains)
+Let \(\mathbf{d}=(d_1,\dots,d_k)\). Assume only that \(\gcd(b_i, m_i) = 1\) for all stages.
+If the moduli are **non-decreasing** \(m_1 \le m_2 \le \cdots \le m_k\), then the pipeline is injective on \( \mathbb{Z}_{m_1}\).
+The reverse algorithm (affine or pure) recovers \(v\) from \(t_k\) uniquely for all \(v\in \mathbb{Z}_{m_1}\).
+
+**Sketch.** Each stage is a permutation on \(\mathbb{Z}_{m_i}\). Forward propagation never shrinks the state-space
+below \(m_1\) if moduli are non-decreasing. Therefore the composite is injective on \( \mathbb{Z}_{m_1}\).
+The reverse algorithm recovers \(t_{i-1}\) uniquely in \(\mathbb{Z}_{m_i}\), and reduction to \(m_{i-1}\) is sound
+because \(t_{i-1}\) originated in \([0,m_{i-1}-1]\). \(\square\)
+
+---
+
+## Corollary 4 (Planned compression)
+If some stage has \(\gcd(b_i,m_i)>1\) or a later modulus is smaller than a previous one, the pipeline can be compressive.
+The image size collapses by at least the product of stage-by-stage factors \(m_i/\gcd(b_i,m_i)\) across the collapsing stages. \(\square\)
+
+---
+
+## Complexity (word-RAM model)
+
+- Forward pipeline (k stages): \(O(k)\) modular multiplies and reductions.
+- Affine adds one modular add per stage: still \(O(k)\).
+- Reverse: \(O(k)\) modular inversions (via extended Euclid) and reductions.
+- Full enumeration test: \(O(m_1 \cdot k)\).
+
+This matches empirical results from the included test harnesses.
+
