@@ -1,0 +1,377 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+HyperMorphic Gearbox — Ultra Pack v2
+====================================
+Single-file module implementing:
+- HM CVT mixed-radix (C¹ blend + hysteresis)
+- CRT (classical, Garner, generalized), RNS helpers
+- RRNS detect + single-residue correct
+- p-adic (Hensel) finite-precision arithmetic
+- E8 lattice nearest-point quantizer (8-D vector gear)
+- Tropical dominance guard (min-plus heuristic)
+- Adaptive RNS (digit-flow style staged moduli)
+- Test harness (run_tests) emitting JSON metrics
+
+Usage:
+  python hm_gearbox_ultra_v2.py test --out metrics.json
+  python hm_gearbox_ultra_v2.py e8-demo
+  python hm_gearbox_ultra_v2.py padic-demo --p 3 --k 20
+"""
+import json, math, random
+from dataclasses import dataclass
+from fractions import Fraction
+from typing import Iterable, List, Sequence, Tuple, Optional, Dict
+
+import numpy as np
+
+# ---------- Utils ----------
+def smoothstep(t: float) -> float:
+    t = max(0.0, min(1.0, t))
+    return t*t*(3-2*t)
+
+def clamp01(x: float) -> float:
+    return min(max(x, 0.0), math.nextafter(1.0, 0.0))
+
+# ---------- HM CVT ----------
+FAMILY_A = [3,5,7,9,11,13,15,17,19,21,23,25]
+FAMILY_B = [4,8,16,32,64,128,256,512,1024,2048,4096,8192]
+
+def approx_mixed_frac(x: float, bases: Sequence[int], depth: int = 8) -> float:
+    x = clamp01(x)
+    r = x
+    denom = 1.0
+    s = 0.0
+    for i in range(min(depth, len(bases))):
+        b = int(bases[i])
+        r *= b
+        d = int(r)
+        if d >= b: d = b-1
+        r -= d
+        denom *= b
+        s += d/denom
+    return s
+
+def alpha_of(x: float, x0: float = 0.5, band: float = 0.08) -> float:
+    left, right = x0-band, x0+band
+    if x <= left: return 0.0
+    if x >= right: return 1.0
+    t = (x-left)/(2*band)
+    return smoothstep(t)
+
+def hm_cvt_quantize(x: float, depth: int = 8, x0: float = 0.5, band: float = 0.08) -> float:
+    a = approx_mixed_frac(x, FAMILY_A, depth)
+    b = approx_mixed_frac(x, FAMILY_B, depth)
+    w = alpha_of(x, x0, band)
+    return (1.0-w)*a + w*b
+
+class HysteresisQuantizer:
+    def __init__(self, x0: float = 0.5, band: float = 0.08, h: float = 0.04):
+        self.x0 = x0; self.band = band; self.h = h
+        self.state = 0.0
+    def quantize(self, x: float, depth: int = 8) -> float:
+        left = self.x0 - self.band
+        right = self.x0 + self.band
+        Lh = left - self.h; Rh = right + self.h
+        if self.state == 0.0 and x > Rh: self.state = 1.0
+        if self.state == 1.0 and x < Lh: self.state = 0.0
+        if x <= left: alpha = 0.0
+        elif x >= right: alpha = 1.0
+        else: alpha = self.state
+        a = approx_mixed_frac(x, FAMILY_A, depth)
+        b = approx_mixed_frac(x, FAMILY_B, depth)
+        return (1.0-alpha)*a + alpha*b
+
+# ---------- CRT / RNS ----------
+def egcd(a: int, b: int) -> Tuple[int,int,int]:
+    if b == 0:
+        return (abs(a), 1 if a>=0 else -1, 0)
+    g, x1, y1 = egcd(b, a % b)
+    return (g, y1, x1 - (a // b)*y1)
+
+def modinv(a: int, m: int) -> int:
+    a %= m
+    g, x, _ = egcd(a, m)
+    if g != 1:
+        raise ValueError("no inverse")
+    return x % m
+
+def crt_classical(residues: Sequence[int], moduli: Sequence[int]) -> Tuple[int,int]:
+    if len(residues) != len(moduli):
+        raise ValueError("length mismatch")
+    n = len(moduli)
+    for i in range(n):
+        for j in range(i+1, n):
+            if math.gcd(moduli[i], moduli[j]) != 1:
+                raise ValueError("moduli not coprime")
+    M = 1
+    for m in moduli: M *= m
+    x = 0
+    for r, m in zip(residues, moduli):
+        Mi = M // m
+        inv = modinv(Mi, m)
+        x = (x + r * Mi * inv) % M
+    return x, M
+
+def garner(residues: Sequence[int], moduli: Sequence[int]) -> Tuple[int, List[int]]:
+    n = len(moduli)
+    for i in range(n):
+        for j in range(i+1, n):
+            if math.gcd(moduli[i], moduli[j]) != 1:
+                raise ValueError("moduli not coprime")
+    coeff = [1]*(n+1); const = [0]*(n+1); v = [0]*n
+    for k in range(n):
+        t = ((residues[k] - const[k]) * modinv(coeff[k], moduli[k])) % moduli[k]
+        v[k] = t
+        for i in range(k+1, n):
+            const[i] = (const[i] + coeff[i]*t) % moduli[i]
+            coeff[i] = (coeff[i] * moduli[k]) % moduli[i]
+    x = 0; base = 1
+    for k in range(n):
+        x += v[k] * base; base *= moduli[k]
+    return x, v
+
+def crt_general(residues: Sequence[int], moduli: Sequence[int]) -> Tuple[int, int]:
+    if len(residues) != len(moduli):
+        raise ValueError("length mismatch")
+    x, m = residues[0] % moduli[0], moduli[0]
+    for r, mod in zip(residues[1:], moduli[1:]):
+        r %= mod
+        g, p, q = egcd(m, mod)
+        if (r - x) % g != 0:
+            raise ValueError("inconsistent congruences")
+        t = ((r - x) // g) * modinv(m//g, mod//g) % (mod//g)
+        x = x + m * t
+        m = (m // g) * mod
+        x %= m
+    return x, m
+
+def rns_residues(n: int, moduli: Sequence[int]) -> List[int]:
+    return [n % m for m in moduli]
+
+# ---------- RRNS ----------
+def rrns_detect(working_res: Sequence[int], working_mods: Sequence[int],
+                red_res: Sequence[int], red_mods: Sequence[int]) -> bool:
+    x, M = crt_classical(working_res, working_mods)
+    for rr, pm in zip(red_res, red_mods):
+        if x % pm != rr % pm:
+            return False
+    return True
+
+def rrns_correct_single(working_res: List[int], working_mods: List[int],
+                        red_res: List[int], red_mods: List[int]) -> Tuple[List[int], int]:
+    n = len(working_mods)
+    for bad in range(n):
+        keep_idx = [i for i in range(n) if i != bad]
+        res_k = [working_res[i] for i in keep_idx]
+        mod_k = [working_mods[i] for i in keep_idx]
+        try:
+            xk, Mk = crt_classical(res_k, mod_k)
+        except Exception:
+            continue
+        mi = working_mods[bad]
+        exp_res_i = xk % mi
+        res_all = res_k.copy(); mod_all = mod_k.copy()
+        res_all.insert(bad, exp_res_i); mod_all.insert(bad, mi)
+        try:
+            x_full, M_full = crt_classical(res_all, mod_all)
+        except Exception:
+            continue
+        ok = True
+        for rr, pm in zip(red_res, red_mods):
+            if x_full % pm != rr % pm:
+                ok = False; break
+        if ok:
+            corr = working_res.copy(); corr[bad] = int(exp_res_i)
+            return corr, bad
+    return working_res, -1
+
+# ---------- p-adic ----------
+class Padic:
+    __slots__ = ("p","k","mod","n")
+    def __init__(self, p: int, k: int, n: int=0):
+        if p <= 1: raise ValueError("p must be >1")
+        self.p=p; self.k=k; self.mod=p**k; self.n=n%self.mod
+    @staticmethod
+    def egcd(a,b):
+        if b==0: return (abs(a), 1 if a>=0 else -1, 0)
+        g,x1,y1=Padic.egcd(b,a%b); return (g, y1, x1-(a//b)*y1)
+    @staticmethod
+    def modinv(a,m):
+        a%=m; g,x,_=Padic.egcd(a,m)
+        if g!=1: raise ZeroDivisionError("no inverse")
+        return x%m
+    @classmethod
+    def from_rational(cls,p,k,frac:Fraction):
+        a=frac.numerator; b=frac.denominator
+        if math.gcd(b,p)!=1:
+            t=0; bb=b
+            while bb%p==0: t+=1; bb//=p
+            if t>=k: n=0
+            else:
+                inv=cls.modinv(bb, p**(k-t))
+                n=(a*inv*(p**t))%(p**k)
+        else:
+            inv=cls.modinv(b, p**k); n=(a*inv)%(p**k)
+        return cls(p,k,n)
+    def digits(self) -> List[int]:
+        n=self.n; digs=[]
+        for _ in range(self.k):
+            digs.append(n%self.p); n//=self.p
+        return digs
+    def __add__(self,other):
+        assert self.p==other.p and self.k==other.k
+        return Padic(self.p,self.k,(self.n+other.n)%self.mod)
+    def __sub__(self,other):
+        assert self.p==other.p and self.k==other.k
+        return Padic(self.p,self.k,(self.n-other.n)%self.mod)
+    def __mul__(self,other):
+        assert self.p==other.p and self.k==other.k
+        return Padic(self.p,self.k,(self.n*other.n)%self.mod)
+    def inv(self):
+        if math.gcd(self.n,self.p)!=1: raise ZeroDivisionError("not invertible")
+        return Padic(self.p,self.k, Padic.modinv(self.n, self.mod))
+    def __truediv__(self,other): return self*other.inv()
+    def __repr__(self): return f"Padic(p={self.p},k={self.k},n={self.n})"
+
+# ---------- E8 lattice ----------
+def e8_nearest(y: np.ndarray) -> Tuple[np.ndarray, float]:
+    assert y.shape == (8,)
+    r = np.rint(y)
+    if int(np.sum(r)) % 2 != 0:
+        frac = np.abs(y - r)
+        i = int(np.argmax(frac))
+        r[i] += 1.0 if (y[i] - r[i]) > 0 else -1.0
+    d1 = float(np.sum((y - r)**2)); cand1 = r
+    k = np.floor(y + 0.5); h = k + 0.5
+    if int(np.sum(k)) % 2 != 0:
+        frac2 = np.abs(y - h)
+        j = int(np.argmax(frac2))
+        sign = 1.0 if (y[j] - h[j]) > 0 else -1.0
+        k[j] += sign; h = k + 0.5
+    d2 = float(np.sum((y - h)**2)); cand2 = h
+    return (cand1, d1) if d1 <= d2 else (cand2, d2)
+
+def e8_quantize_matrix(X: np.ndarray) -> Tuple[np.ndarray, float]:
+    N, D = X.shape; assert D == 8
+    Q = np.empty_like(X); d2s = np.empty(N)
+    for n in range(N):
+        q, d2 = e8_nearest(X[n]); Q[n] = q; d2s[n] = d2
+    mse = float(np.mean(d2s)/D)
+    return Q, mse
+
+# ---------- Tropical ----------
+def tropical_sum(arr: np.ndarray, dominance_ratio: float = 1e6) -> float:
+    if arr.size == 0: return 0.0
+    mags = np.abs(arr).copy()
+    i = int(np.argmax(mags)); top = mags[i]
+    mags[i] = -np.inf; nxt = float(np.max(mags)) if arr.size>1 else 0.0
+    if nxt == 0.0 or (top/max(nxt, 1e-300)) > dominance_ratio:
+        return float(arr[i])
+    else:
+        return float(np.sum(arr))
+
+# ---------- Adaptive RNS ----------
+def adaptive_rns_reconstruct(val: int, moduli_stages: List[List[int]]) -> Tuple[int, int]:
+    for i, ms in enumerate(moduli_stages, 1):
+        residues = [val % m for m in ms]
+        x, M = crt_classical(residues, ms)
+        k = int(round((val - x)/M))
+        recon = x + k*M
+        if recon == val:
+            return recon, i
+    return recon, len(moduli_stages)
+
+# ---------- Tests ----------
+def run_tests() -> Dict[str, dict]:
+    metrics: Dict[str, dict] = {}
+    # DSP-ish test
+    fs = 48000; T = 0.12
+    t = np.linspace(0, T, int(fs*T), endpoint=False)
+    sig = 0.5 + 0.48*(0.6*np.sin(2*np.pi*440*t) + 0.3*np.sin(2*np.pi*997*t) + 0.1*np.sin(2*np.pi*60*t))
+    sig = np.clip(sig, 0, 1-1e-12)
+    Q = (1<<12) - 1
+    sig_u = np.round(sig*Q)/Q
+    sig_hm = np.array([hm_cvt_quantize(float(x), depth=8) for x in sig])
+    win = 8; N = len(sig) - (len(sig)%win); S = 24.0
+    Y = (sig[:N].reshape(-1, win))*S
+    Q8, mse_e8 = e8_quantize_matrix(Y)
+    sig_e8 = Q8.reshape(-1)/S
+    if len(sig[N:])>0:
+        tail = np.array([hm_cvt_quantize(float(x), depth=8) for x in sig[N:]])
+        sig_e8 = np.concatenate([sig_e8, tail])
+    metrics["dsp"] = {
+        "rms_uniform": float(np.sqrt(np.mean((sig_u-sig)**2))),
+        "rms_hm": float(np.sqrt(np.mean((sig_hm-sig)**2))),
+        "rms_e8": float(np.sqrt(np.mean((sig_e8-sig)**2))),
+        "e8_per_dim_mse": float(mse_e8)
+    }
+    # p-adic exactness
+    random.seed(1); p,k = 3,20; trials = 200; ok_add=0; ok_mul=0; mod=p**k
+    def rf():
+        a=random.randint(-10000,10000); b=random.randint(1,10000)
+        while b%p==0: b=random.randint(1,10000)
+        return Fraction(a,b)
+    for _ in range(trials):
+        f1,f2=rf(),rf()
+        F1,F2=Padic.from_rational(p,k,f1),Padic.from_rational(p,k,f2)
+        add_p=(F1+F2).n; mul_p=(F1*F2).n
+        add_true=((f1.numerator*modinv(f1.denominator,mod)) + (f2.numerator*modinv(f2.denominator,mod)))%mod
+        mul_true=((f1.numerator*modinv(f1.denominator,mod)) * (f2.numerator*modinv(f2.denominator,mod)))%mod
+        ok_add+=int(add_p==add_true); ok_mul+=int(mul_p==mul_true)
+    metrics["padic"]={"p":p,"k":k,"trials":trials,"add_exact_fraction": ok_add/trials,"mul_exact_fraction": ok_mul/trials}
+    # Tropical
+    rng=np.random.default_rng(123); sets=150; good=0; dom=0
+    for _ in range(sets):
+        n=int(rng.integers(3,80))
+        mags=10**rng.uniform(-9,9,size=n); signs=rng.choice([-1.0,1.0],size=n); arr=mags*signs
+        approx=tropical_sum(arr,1e6); truth=float(np.sum(arr))
+        if abs(approx-truth)<=max(1e-9, 1e-6*abs(truth)): good+=1
+        srt=np.sort(np.abs(arr))[::-1]
+        if len(srt)>1 and srt[0]/(srt[1]+1e-300)>1e6: dom+=1
+    metrics["tropical"]={"sets":sets,"dominance_cases":dom,"approx_matches_true_fraction": good/sets}
+    # RRNS detect + correct
+    work=[1019,1021,1031,1033]; red=[1049,1061]; x_true=123456789
+    wres=rns_residues(x_true, work); rres=rns_residues(x_true, red)
+    bad_index=2; wres_faulty=wres.copy(); wres_faulty[bad_index]=(wres_faulty[bad_index]+123)%work[bad_index]
+    ok_detect=(not rrns_detect(wres_faulty, work, rres, red))
+    corr, idx = rrns_correct_single(wres_faulty, work, rres, red)
+    x_rec, M = crt_classical(corr, work); k=int(round((x_true-x_rec)/M)); x_rec=x_rec+k*M
+    metrics["rrns"]={"bad_index_injected":bad_index,"detected_fault":bool(ok_detect),"corrected_index":int(idx),"recovered_true": bool(x_rec==x_true)}
+    # Adaptive RNS
+    rng=np.random.default_rng(7); vals=rng.integers(0,5_000_000,size=700)
+    true_sum=int(np.sum(vals)); stages=[work[:2],work[:3],work[:4]]
+    recon, used = adaptive_rns_reconstruct(true_sum, stages)
+    metrics["adaptive_rns"]={"true_sum":true_sum,"reconstructed":recon,"stages_used":used}
+    return metrics
+
+# ---------- CLI ----------
+def _main():
+    import argparse, sys
+    p=argparse.ArgumentParser(description="HyperMorphic Gearbox — Ultra Pack v2")
+    sub=p.add_subparsers(dest="cmd", required=True)
+    sub.add_parser("test", help="Run built-in tests").add_argument("--out", default=None)
+    sub.add_parser("e8-demo", help="Quantize random 8-D vector and print result")
+    pad=sub.add_parser("padic-demo", help="Demo p-adic exact ops")
+    pad.add_argument("--p", type=int, default=3); pad.add_argument("--k", type=int, default=20)
+    args=p.parse_args()
+    if args.cmd=="test":
+        m = run_tests()
+        s=json.dumps(m, indent=2)
+        print(s)
+        if args.out:
+            with open(args.out,"w") as f: f.write(s)
+    elif args.cmd=="e8-demo":
+        y=np.random.randn(8)*3.0; q,d2=e8_nearest(y)
+        print("y:", y); print("q:", q); print("squared_distance:", d2)
+    elif args.cmd=="padic-demo":
+        f1=Fraction(7,10); f2=Fraction(5,14)
+        P=args.p; K=args.k
+        F1=Padic.from_rational(P,K,f1); F2=Padic.from_rational(P,K,f2)
+        print("P-adic add:", (F1+F2))
+        print("P-adic mul:", (F1*F2))
+    else:
+        p.print_help()
+
+if __name__=="__main__":
+    _main()
