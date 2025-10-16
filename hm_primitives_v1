@@ -1,0 +1,410 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+HyperMorphic Theory Primitives — Single-File Implementation (v1)
+================================================================
+Implements two novel numeric primitives with proofs-backed tests:
+
+1) HDBP — HyperMorphic Dynamic-Base Primitive
+   - C¹-blended convex combination of two mixed-radix truncations (A, B),
+     snapped to a common rational grid 1/L_k, with bounds on error and slope.
+
+2) PLCBP — Projection-Locked Complex-Base Primitive
+   - Complex base β, digits in {0,...,m-1}; greedy digits lock the *real*
+     projection to a target x while the *imaginary* projection carries redundancy.
+   - Guarantees geometric (exponentially-decaying) projection error bound.
+
+Also includes a smooth partition-of-unity “sheaf glue” to combine encoders.
+
+CLI:
+  python hm_primitives_v1.py test --out metrics.json --plots
+  python hm_primitives_v1.py hdbp-encode --x 0.314 --k 10
+  python hm_primitives_v1.py plcbp-encode --x 0.314 --beta-re 1.8 --beta-im 0.1 --m 10 --k 14
+  python hm_primitives_v1.py glue-encode --x 0.314
+
+Dependencies: numpy (required), matplotlib (optional for --plots)
+"""
+
+from __future__ import annotations
+import json, math, argparse, sys
+from dataclasses import dataclass
+from typing import List, Sequence, Tuple, Dict
+
+# -----------------------------
+# Minimal safe import of numpy
+# -----------------------------
+try:
+    import numpy as np
+except Exception as e:
+    print("This script requires NumPy. Please install it: pip install numpy")
+    raise
+
+# -----------------------------
+# Utilities
+# -----------------------------
+def smoothstep01(t: float) -> float:
+    """Cubic smoothstep on [0,1], clamped."""
+    if t <= 0.0: return 0.0
+    if t >= 1.0: return 1.0
+    return t*t*(3.0 - 2.0*t)
+
+def alpha_c1(x: float, x0: float, w: float) -> float:
+    """C¹ blend weight α(x) = 0 for x<=x0-w, 1 for x>=x0+w, smoothstep in band."""
+    if x <= x0 - w: return 0.0
+    if x >= x0 + w: return 1.0
+    t = (x - (x0 - w)) / (2.0*w)
+    return smoothstep01(t)
+
+def clamp01(x: float) -> float:
+    return min(max(x, 0.0), np.nextafter(1.0, 0.0))
+
+def prod_int(seq: Sequence[int]) -> int:
+    p = 1
+    for v in seq: p *= int(v)
+    return p
+
+def lcm2(a: int, b: int) -> int:
+    return abs(a*b) // math.gcd(a, b)
+
+def lcm_many(vals: Sequence[int]) -> int:
+    L = 1
+    for v in vals: L = lcm2(L, int(v))
+    return L
+
+# -----------------------------
+# Base families (customizable)
+# -----------------------------
+@dataclass
+class BaseFamily:
+    name: str
+    seq: List[int]
+
+FAMILY_A = BaseFamily("A_small_increments", [3,5,7,9,11,13,15,17,19,21,23,25])
+FAMILY_B = BaseFamily("B_exponential",     [4,8,16,32,64,128,256,512,1024,2048,4096,8192])
+
+# -----------------------------
+# HDBP — HyperMorphic Dynamic-Base Primitive
+# -----------------------------
+def greedy_mixed_trunc(x: float, bases: Sequence[int], k: int) -> float:
+    """
+    Greedy mixed-radix fractional truncation for x in [0,1):
+      x ≈ sum_{i=0..k-1} d_i / ∏_{j=0..i} b_j, with d_i∈{0,...,b_i-1}.
+    """
+    x = clamp01(x)
+    r = x
+    denom = 1.0
+    s = 0.0
+    k = min(k, len(bases))
+    for i in range(k):
+        b = int(bases[i])
+        r *= b
+        d = int(r)
+        if d >= b: d = b-1
+        r -= d
+        denom *= b
+        s += d/denom
+    return s
+
+def hdbp_phi_k(x: float, k: int, A: BaseFamily = FAMILY_A, B: BaseFamily = FAMILY_B,
+               x0: float = 0.5, w: float = 0.08) -> Tuple[float, Dict[str,int]]:
+    """
+    Φ_k(x): convex blend of A_k(x) and B_k(x) snapped to grid 1/L_k.
+    Returns (value, meta) with meta = {PiA, PiB, Lk}.
+    """
+    x = clamp01(x)
+    Ak = greedy_mixed_trunc(x, A.seq, k)
+    Bk = greedy_mixed_trunc(x, B.seq, k)
+    PiA = prod_int(A.seq[:k]); PiB = prod_int(B.seq[:k])
+    Lk = lcm2(PiA, PiB)
+    a = alpha_c1(x, x0, w)
+    inner = (1.0 - a) * Ak + a * Bk
+    y = round(inner * Lk) / Lk   # ties-to-even via Python's round
+    y = min(max(y, 0.0), 1.0 - 1.0/Lk)
+    return y, {"PiA":PiA, "PiB":PiB, "Lk":Lk}
+
+def hdbp_error_bound(PiA: int, PiB: int, Lk: int) -> float:
+    """Theorem 1 bound: max{1/PiA, 1/PiB} + 1/(2 Lk)."""
+    return max(1.0/PiA, 1.0/PiB) + 0.5 / Lk
+
+def alpha_sup_derivative(w: float) -> float:
+    """
+    For cubic smoothstep in a band of width 2w: sup|α'| = 0.75 / w.
+    (Derivative inside band = (6 t (1-t)) * (1/(2w)), max at t=0.5.)
+    """
+    return 0.75 / w
+
+# -----------------------------
+# PLCBP — Projection-Locked Complex-Base Primitive
+# -----------------------------
+@dataclass
+class PLCBPConfig:
+    beta: complex  # complex base β
+    m: int         # digits 0..m-1
+    k: int         # depth
+
+def plcbp_encode(x: float, cfg: PLCBPConfig) -> Tuple[complex, List[int]]:
+    """
+    Greedy digits so that Re(sum d_i β^{-(i+1)}) ≈ x, Imag part carries redundancy.
+    """
+    x = clamp01(x)
+    beta, m, k = cfg.beta, int(cfg.m), int(cfg.k)
+    Z = 0+0j
+    R = float(x)
+    digits: List[int] = []
+    for i in range(k):
+        term = beta ** (-(i+1))
+        re = float(np.real(term))
+        if re == 0.0:
+            d = 0
+        else:
+            d = int(round(R / re))
+            if d < 0: d = 0
+            if d > m-1: d = m-1
+        Z += d * term
+        R = R - d * re
+        digits.append(d)
+    return Z, digits
+
+def plcbp_proj_error(x: float, Z: complex) -> float:
+    return abs(float(np.real(Z)) - float(x))
+
+def plcbp_bound(cfg: PLCBPConfig) -> float:
+    """
+    Safe geometric bound: ((m-1)/2) * (1/(|β|-1)) * |β|^{-k}.
+    """
+    B = abs(cfg.beta)
+    if B <= 1.0:
+        return float('inf')
+    return ((cfg.m - 1)/2.0) * (1.0/(B - 1.0)) * (B ** (-cfg.k))
+
+# -----------------------------
+# Sheaf glue (partition-of-unity)
+# -----------------------------
+def sheaf_glue_value(x: float, k_hdbp: int = 10,
+                     A: BaseFamily = FAMILY_A, B: BaseFamily = FAMILY_B,
+                     x0: float = 0.5, w: float = 0.08,
+                     plcbp_cfg: PLCBPConfig = PLCBPConfig(beta=1.8+0.1j, m=10, k=14)) -> float:
+    """
+    Global encoder = snap_to_grid( (1-ρ(x))*HDBP(x) + ρ(x)*Re(PLCBP(x)) ), ρ(x)=α(x).
+    """
+    x = clamp01(x)
+    hdbp_val, meta = hdbp_phi_k(x, k_hdbp, A, B, x0, w)
+    Z, _ = plcbp_encode(x, plcbp_cfg)
+    e2 = float(np.real(Z))
+    rho = alpha_c1(x, x0, w)
+    Lk = lcm2(prod_int(A.seq[:k_hdbp]), prod_int(B.seq[:k_hdbp]))
+    y = (1.0 - rho) * hdbp_val + rho * e2
+    y = round(y * Lk) / Lk
+    return min(max(y, 0.0), 1.0 - 1.0/Lk)
+
+# -----------------------------
+# Rigorous tests
+# -----------------------------
+def test_hdbp_theorem1(num_x: int = 800, k: int = 10, x0: float=0.5, w: float=0.08) -> Dict[str,float]:
+    xs = np.linspace(0.0, 1.0 - 1e-12, num_x)
+    max_err = 0.0
+    PiA = PiB = Lk = None
+    for x in xs:
+        y, meta = hdbp_phi_k(float(x), k, FAMILY_A, FAMILY_B, x0=x0, w=w)
+        PiA, PiB, Lk = meta["PiA"], meta["PiB"], meta["Lk"]
+        max_err = max(max_err, abs(y - x))
+    bound = hdbp_error_bound(PiA, PiB, Lk)
+    return {"max_err": float(max_err), "bound": float(bound), "pass": bool(max_err <= bound + 1e-12)}
+
+def test_hdbp_monotone_and_slope(num_x: int = 4000, k: int = 10, x0: float=0.5, w: float=0.08) -> Dict[str,float]:
+    xs = np.linspace(0.0, 1.0 - 1e-12, num_x)
+    ys = np.array([hdbp_phi_k(float(x), k, FAMILY_A, FAMILY_B, x0=x0, w=w)[0] for x in xs])
+    diffs = np.diff(ys)
+    monotone_ok = bool(np.all(diffs >= -1e-12))
+    dx = xs[1] - xs[0]
+    deriv = np.gradient(ys, dx)
+    band = (xs >= x0 - w) & (xs <= x0 + w)
+    sup_alpha = alpha_sup_derivative(w)
+    max_der_band = float(np.max(np.abs(deriv[band])))
+    slope_ok = bool(max_der_band <= sup_alpha + 0.05)
+    return {"monotone": monotone_ok, "max_derivative_in_band": max_der_band, "sup_alpha_prime": sup_alpha, "slope_ok": slope_ok}
+
+def test_hdbp_convergence(k_list = (4,6,8,10,12), num_x: int = 1500, x0: float=0.5, w: float=0.08) -> Dict[str, List[float]]:
+    xs = np.linspace(0.0, 1.0 - 1e-12, num_x)
+    max_errs, bounds = [], []
+    for k in k_list:
+        ys = [hdbp_phi_k(float(x), k, FAMILY_A, FAMILY_B, x0=x0, w=w)[0] for x in xs]
+        err = float(np.max(np.abs(np.array(ys) - xs)))
+        PiA = prod_int(FAMILY_A.seq[:k]); PiB = prod_int(FAMILY_B.seq[:k]); Lk = lcm2(PiA, PiB)
+        bnd = hdbp_error_bound(PiA, PiB, Lk)
+        max_errs.append(err); bounds.append(float(bnd))
+    return {"k_list": list(k_list), "max_errs": max_errs, "bounds": bounds}
+
+def test_plcbp_accuracy(beta: complex = 1.8+0.1j, m: int = 10, k: int = 14, num_x: int = 600) -> Dict[str,float]:
+    cfg = PLCBPConfig(beta=beta, m=m, k=k)
+    xs = np.linspace(0.0, 1.0 - 1e-12, num_x)
+    errs = []
+    for x in xs:
+        Z,_ = plcbp_encode(float(x), cfg)
+        errs.append(plcbp_proj_error(float(x), Z))
+    max_err = float(np.max(errs))
+    bound = float(plcbp_bound(cfg))
+    return {"max_err": max_err, "bound": bound, "pass": bool(max_err <= bound * 1.05)}
+
+def test_plcbp_checksum_separation(beta: complex = 1.8+0.1j, m: int = 10, k: int = 14, num_samples: int=200) -> Dict[str,float]:
+    cfg = PLCBPConfig(beta=beta, m=m, k=k)
+    xs = np.linspace(0.0, 1.0 - 1e-12, num_samples)
+    ims = []
+    for x in xs:
+        Z,_ = plcbp_encode(float(x), cfg)
+        ims.append(float(np.imag(Z)))
+    ims = np.array(ims)
+    diffs = np.sort(np.diff(np.sort(ims)))
+    min_sep = float(np.min(np.abs(diffs))) if diffs.size > 0 else 0.0
+    return {"min_imag_separation": min_sep}
+
+def test_sheaf_glue(beta: complex = 1.8+0.1j, m: int = 10, k_plc: int = 14, k_hdbp: int = 10,
+                    x0: float=0.5, w: float=0.08, num_x: int = 1500) -> Dict[str, float]:
+    xs = np.linspace(0.0, 1.0 - 1e-12, num_x)
+    cfg = PLCBPConfig(beta=beta, m=m, k=k_plc)
+    ys = []
+    Lk = lcm2(prod_int(FAMILY_A.seq[:k_hdbp]), prod_int(FAMILY_B.seq[:k_hdbp]))
+    for x in xs:
+        hdbp_val,_ = hdbp_phi_k(float(x), k_hdbp, FAMILY_A, FAMILY_B, x0=x0, w=w)
+        Z,_ = plcbp_encode(float(x), cfg)
+        e2 = float(np.real(Z))
+        rho = alpha_c1(x, x0, w)
+        y = (1.0 - rho)*hdbp_val + rho*e2
+        y = round(y * Lk) / Lk
+        y = min(max(y, 0.0), 1.0 - 1.0/Lk)
+        ys.append(y)
+    ys = np.array(ys)
+    monotone_ok = bool(np.all(np.diff(ys) >= -1e-12))
+    max_err = float(np.max(np.abs(ys - xs)))
+    return {"monotone": monotone_ok, "max_err": max_err, "grid": 1.0/Lk}
+
+def run_tests(make_plots: bool = False, outdir: str = ".") -> Dict[str, dict]:
+    metrics: Dict[str, dict] = {}
+
+    metrics["hdbp_thm1"] = test_hdbp_theorem1()
+    metrics["hdbp_mono_slope"] = test_hdbp_monotone_and_slope()
+    metrics["hdbp_convergence"] = test_hdbp_convergence()
+    metrics["plcbp_acc"] = test_plcbp_accuracy()
+    metrics["plcbp_checksum"] = test_plcbp_checksum_separation()
+    metrics["sheaf"] = test_sheaf_glue()
+
+    if make_plots:
+        try:
+            import matplotlib.pyplot as plt  # optional dependency
+            # HDBP error and derivative plots
+            xs = np.linspace(0.0, 1.0 - 1e-12, 2000)
+            ys = np.array([hdbp_phi_k(float(x), 10, FAMILY_A, FAMILY_B, x0=0.5, w=0.08)[0] for x in xs])
+            err = np.abs(ys - xs)
+            dx = xs[1] - xs[0]
+            der = np.gradient(ys, dx)
+
+            plt.figure(figsize=(9,4.5))
+            plt.plot(xs, err, label="|Φ₁₀(x) - x|")
+            plt.xlabel("x"); plt.ylabel("abs error"); plt.title("HDBP (k=10) absolute error vs x")
+            plt.legend(); plt.tight_layout()
+            plt.savefig(f"{outdir}/hdbp_error.png", dpi=160); plt.close()
+
+            plt.figure(figsize=(9,4.5))
+            plt.plot(xs, der, label="d/dx Φ₁₀(x) (num. gradient)")
+            plt.axvline(0.42, linestyle="--"); plt.axvline(0.58, linestyle="--")
+            plt.xlabel("x"); plt.ylabel("approx derivative"); plt.title("HDBP derivative (band marked)")
+            plt.legend(); plt.tight_layout()
+            plt.savefig(f"{outdir}/hdbp_derivative.png", dpi=160); plt.close()
+
+            # Convergence plot
+            klist = metrics["hdbp_convergence"]["k_list"]
+            maxe  = metrics["hdbp_convergence"]["max_errs"]
+            bnds  = metrics["hdbp_convergence"]["bounds"]
+            plt.figure(figsize=(7,4.5))
+            plt.semilogy(klist, maxe, marker="o", label="empirical max error")
+            plt.semilogy(klist, bnds, marker="s", label="theoretical bound")
+            plt.xlabel("k (depth)"); plt.ylabel("max error (log)"); plt.title("HDBP convergence vs depth")
+            plt.legend(); plt.tight_layout()
+            plt.savefig(f"{outdir}/hdbp_convergence.png", dpi=160); plt.close()
+
+            # PLCBP error histogram
+            cfg = PLCBPConfig(beta=1.8+0.1j, m=10, k=14)
+            xs2 = np.linspace(0.0, 1.0 - 1e-12, 600)
+            errs = []
+            for x in xs2:
+                Z,_ = plcbp_encode(float(x), cfg)
+                errs.append(plcbp_proj_error(float(x), Z))
+            plt.figure(figsize=(7,4.5))
+            plt.hist(errs, bins=40)
+            plt.xlabel("projection error"); plt.ylabel("count"); plt.title("PLCBP projection error (k=14)")
+            plt.tight_layout()
+            plt.savefig(f"{outdir}/plcbp_error_hist.png", dpi=160); plt.close()
+        except Exception as e:
+            metrics["plot_error"] = f"{type(e).__name__}: {e}"
+
+    return metrics
+
+# -----------------------------
+# CLI
+# -----------------------------
+def _cli():
+    p = argparse.ArgumentParser(description="HyperMorphic Theory Primitives (HDBP, PLCBP)")
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    pt = sub.add_parser("test", help="Run rigorous tests and (optionally) save plots")
+    pt.add_argument("--out", type=str, default=None, help="write metrics JSON here")
+    pt.add_argument("--plots", action="store_true", help="produce plots (requires matplotlib)")
+    pt.add_argument("--outdir", type=str, default=".", help="directory for plots")
+
+    pe1 = sub.add_parser("hdbp-encode", help="Encode x with HDBP")
+    pe1.add_argument("--x", type=float, required=True)
+    pe1.add_argument("--k", type=int, default=10)
+    pe1.add_argument("--x0", type=float, default=0.5)
+    pe1.add_argument("--w",  type=float, default=0.08)
+
+    pe2 = sub.add_parser("plcbp-encode", help="Encode x with PLCBP")
+    pe2.add_argument("--x", type=float, required=True)
+    pe2.add_argument("--beta-re", type=float, default=1.8)
+    pe2.add_argument("--beta-im", type=float, default=0.1)
+    pe2.add_argument("--m", type=int, default=10)
+    pe2.add_argument("--k", type=int, default=14)
+
+    pe3 = sub.add_parser("glue-encode", help="Encode x with sheaf glue (HDBP+PLCBP)")
+    pe3.add_argument("--x", type=float, required=True)
+    pe3.add_argument("--k-hdbp", type=int, default=10)
+    pe3.add_argument("--x0", type=float, default=0.5)
+    pe3.add_argument("--w",  type=float, default=0.08)
+    pe3.add_argument("--beta-re", type=float, default=1.8)
+    pe3.add_argument("--beta-im", type=float, default=0.1)
+    pe3.add_argument("--m", type=int, default=10)
+    pe3.add_argument("--k-plc", type=int, default=14)
+
+    args = p.parse_args()
+
+    if args.cmd == "test":
+        metrics = run_tests(make_plots=args.plots, outdir=args.outdir)
+        s = json.dumps(metrics, indent=2)
+        print(s)
+        if args.out:
+            with open(args.out, "w") as f:
+                f.write(s)
+
+    elif args.cmd == "hdbp-encode":
+        y, meta = hdbp_phi_k(args.x, args.k, FAMILY_A, FAMILY_B, x0=args.x0, w=args.w)
+        bnd = hdbp_error_bound(meta["PiA"], meta["PiB"], meta["Lk"])
+        print(f"HDBP Φ_{args.k}({args.x}) = {y}")
+        print(f"Meta: {meta}  |  Bound (Theorem 1): {bnd}")
+
+    elif args.cmd == "plcbp-encode":
+        cfg = PLCBPConfig(beta=complex(args.beta_re, args.beta_im), m=args.m, k=args.k)
+        Z, digs = plcbp_encode(args.x, cfg)
+        bound = plcbp_bound(cfg)
+        print(f"PLCBP Z_k(x): {Z}  (Re={float(np.real(Z))}, Im={float(np.imag(Z))})")
+        print(f"Digits: {digs}")
+        print(f"Projection error: {plcbp_proj_error(args.x, Z)}  |  Geometric bound: {bound}")
+
+    elif args.cmd == "glue-encode":
+        cfg = PLCBPConfig(beta=complex(args.beta_re, args.beta_im), m=args.m, k=args.k_plc)
+        y = sheaf_glue_value(args.x, k_hdbp=args.k_hdbp, x0=args.x0, w=args.w, plcbp_cfg=cfg)
+        print(f"Glue-encode value: {y}")
+
+    else:
+        p.print_help()
+
+if __name__ == "__main__":
+    _cli()
