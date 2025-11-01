@@ -914,4 +914,107 @@ print(f"Fidelity: {result.fidelity * 100:.2f}%")
 print(f"Latency: {result.latency_ms:.4f} ms")
 print(f"Theorem 1 Satisfied: {result.theorem_1}")
 print()
+
+# Demo 2: HyperQubit System
+print("Demo 2: HyperQubit System with 32 HyperQubits")
+print("-" * 80)
+system = HyperQubitSystem(num_hqubits=32)
+system.initialize(base_dimension=2000)
+coherence = system.measure_coherence()
+print(f"System Coherence Score: {coherence.coherence_score:.4f}")
+print(f"Average Fidelity: {coherence.average_fidelity:.4f}")
+print(f"Success Rate: {coherence.success_rate * 100:.2f}%")
+print()
+
+# Demo 3: Entanglement Network
+print("Demo 3: Building Entanglement Network")
+print("-" * 80)
+network = system.build_entanglement_network(connectivity=0.2)
+stats = system.get_entanglement_stats()
+print(f"Total Connections: {stats['total_connections']}")
+print(f"Strong Entanglements: {stats['strong_entanglements']}")
+print(f"Average Correlation: {stats['avg_correlation']:.4f}")
+print(f"Network Density: {stats['network_density'] * 100:.2f}%")
+print()
+
+# Demo 4: Quantum Algorithms
+print("Demo 4: Grover's Search Algorithm")
+print("-" * 80)
+search_system = HyperQubitSystem(num_hqubits=16)
+search_system.initialize()
+grover_result = QuantumAlgorithms.grovers_search(search_system, target_index=7, iterations=3)
+print(f"Target Index: {grover_result['target_index']}")
+print(f"Found Index: {grover_result['found_index']}")
+print(f"Success: {grover_result['success']}")
+print(f"Probability: {grover_result['probability'] * 100:.2f}%")
+print(f"Speedup: {grover_result['speedup']:.2f}x")
+print()
+
+# Demo 5: Applications
+print("Demo 5: Post-Quantum Cryptography")
+print("-" * 80)
+crypto = HyperQubitApplications.post_quantum_cryptography(key_length=2048)
+print(f"Key Length: {crypto['key_length']} bits")
+print(f"HyperQubits Used: {crypto['hqubits_used']}")
+print(f"Key Generation Time: {crypto['key_gen_time_ms']:.2f} ms")
+print(f"Quantum Resistant: {crypto['quantum_resistant']}")
+print()
+
+print("Demo 6: Traveling Salesman Optimization")
+print("-" * 80)
+tsp = HyperQubitApplications.optimize_traveling_salesman(num_cities=20)
+print(f"Number of Cities: {tsp['num_cities']}")
+print(f"Solution Time: {tsp['solution_time_ms']:.2f} ms")
+print(f"Speedup vs Classical: {tsp['speedup']:.2f}x")
+print(f"Optimality Gap: {tsp['optimality_gap'] * 100:.2f}%")
+print()
+
+print("=" * 80)
+print("All demos completed successfully!")
+print("=" * 80)
 ```
+
+if **name** == “**main**”:
+main()
+
+# ============================================================================
+
+# EXPORT API
+
+# ============================================================================
+
+**all** = [
+# Core classes
+‘HyperQubit’,
+‘HyperQubitSystem’,
+‘TransformResult’,
+‘SystemCoherence’,
+‘EntanglementPair’,
+
+```
+# Utilities
+'MathUtils',
+'TheoremValidator',
+
+# Algorithms
+'QuantumAlgorithms',
+
+# Applications
+'HyperQubitApplications',
+
+# Benchmarking
+'Benchmark',
+```
+
+]
+
+# ============================================================================
+
+# VERSION INFO
+
+# ============================================================================
+
+**version** = “1.0.0”
+**author** = “HyperQubit Research Team”
+**license** = “MIT”
+**description** = “Quantum-inspired classical computing through HyperMorphic transformations”
